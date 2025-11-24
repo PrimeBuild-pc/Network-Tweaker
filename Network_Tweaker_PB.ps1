@@ -12,6 +12,18 @@ if (-not (Test-Path $Global:BackupDir)) { New-Item -Path $Global:BackupDir -Item
 
 function Get-TimeStamp { Get-Date -Format "yyyyMMdd_HHmmss" }
 
+function Start-ConsoleTest {
+    param(
+        [string]$Command,
+        [string]$Title
+    )
+    try {
+        Start-Process -FilePath "powershell.exe" -ArgumentList "-NoExit","-Command","Write-Host '$Title' -ForegroundColor Cyan; $Command" | Out-Null
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show("Impossibile avviare il test: $($_.Exception.Message)","Test",[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+    }
+}
+
 # --- QoS helpers ---
 function Ensure-NetQosModule {
     try { Import-Module NetQos -ErrorAction Stop } catch {}
@@ -661,8 +673,8 @@ function Toggle-TcpAutotuning {
 function Get-NicsForAffinity {
     $nics = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.HardwareInterface -eq $true }
     $list = @()
-        foreach ($n in $nics) { 
-            $w = Get-WmiObject Win32_NetworkAdapter -Filter ("GUID='{0}'" -f $n.InterfaceGuid.ToString("B").ToUpper()) 
+        foreach ($n in $nics) {
+            $w = Get-WmiObject Win32_NetworkAdapter -Filter ("GUID='{0}'" -f $n.InterfaceGuid.ToString("B").ToUpper())
             if ($w) { 
             $list += [PSCustomObject]@{
                 Name        = $n.Name
@@ -678,6 +690,135 @@ function Get-NicsForAffinity {
         }
     }
     return $list
+}
+
+# --- NIC profile helpers (advanced properties) ---
+function Find-AdvancedProperty {
+    param($Adapter,[string[]]$Names)
+    foreach ($name in $Names) {
+        try {
+            $p = Get-NetAdapterAdvancedProperty -Name $Adapter.Name -DisplayName $name -ErrorAction Stop
+            if ($p) { return $p }
+        } catch {}
+        try {
+            $p = Get-NetAdapterAdvancedProperty -Name $Adapter.Name -RegistryKeyword $name -ErrorAction Stop
+            if ($p) { return $p }
+        } catch {}
+    }
+    return $null
+}
+
+function Set-InterruptModeration {
+    param($Adapter,[string]$Value)
+    $prop = Find-AdvancedProperty -Adapter $Adapter -Names @('Interrupt Moderation','Interrupt Moderation Rate')
+    if ($prop) {
+        Set-NetAdapterAdvancedProperty -Name $Adapter.Name -DisplayName $prop.DisplayName -DisplayValue $Value -NoRestart -ErrorAction SilentlyContinue | Out-Null
+    }
+}
+
+function Set-Buffers {
+    param($Adapter,[int]$Rx,[int]$Tx)
+    $rxProp = Find-AdvancedProperty -Adapter $Adapter -Names @('Receive Buffers','Receive Buffer')
+    $txProp = Find-AdvancedProperty -Adapter $Adapter -Names @('Transmit Buffers','Transmit Buffer')
+    if ($rxProp) { Set-NetAdapterAdvancedProperty -Name $Adapter.Name -DisplayName $rxProp.DisplayName -DisplayValue $Rx -NoRestart -ErrorAction SilentlyContinue | Out-Null }
+    if ($txProp) { Set-NetAdapterAdvancedProperty -Name $Adapter.Name -DisplayName $txProp.DisplayName -DisplayValue $Tx -NoRestart -ErrorAction SilentlyContinue | Out-Null }
+}
+
+function Enable-IfPresent {
+    param($Adapter,[string[]]$Names)
+    foreach ($name in $Names) {
+        $prop = Find-AdvancedProperty -Adapter $Adapter -Names @($name)
+        if ($prop) {
+            Set-NetAdapterAdvancedProperty -Name $Adapter.Name -DisplayName $prop.DisplayName -DisplayValue 'Enabled' -NoRestart -ErrorAction SilentlyContinue | Out-Null
+        }
+    }
+}
+
+function Disable-IfPresent {
+    param($Adapter,[string[]]$Names)
+    foreach ($name in $Names) {
+        $prop = Find-AdvancedProperty -Adapter $Adapter -Names @($name)
+        if ($prop) {
+            Set-NetAdapterAdvancedProperty -Name $Adapter.Name -DisplayName $prop.DisplayName -DisplayValue 'Disabled' -NoRestart -ErrorAction SilentlyContinue | Out-Null
+        }
+    }
+}
+
+function Apply-AdapterProfile {
+    param([string]$Preset,[string]$NicName)
+    $adapter = Get-NetAdapter -Name $NicName -ErrorAction SilentlyContinue
+    if (-not $adapter) { return $false }
+    switch ($Preset) {
+        'Realtek8111H' {
+            Set-InterruptModeration $adapter 'Off'
+            Disable-IfPresent  $adapter @('Large Send Offload','Large Send Offload v2 (IPv4)','Large Send Offload v2 (IPv6)','LSO')
+            Disable-IfPresent  $adapter @('Flow Control')
+            Disable-IfPresent  $adapter @('Green Ethernet','Power Saving Mode')
+            Set-Buffers        $adapter 1024 1024
+        }
+        'Realtek8125' {
+            Set-InterruptModeration $adapter 'Low'
+            Enable-IfPresent   $adapter @('Large Send Offload','Large Send Offload v2 (IPv4)','Large Send Offload v2 (IPv6)')
+            Disable-IfPresent  $adapter @('Flow Control')
+            Disable-IfPresent  $adapter @('Energy Efficient Ethernet','Green Ethernet','EEE')
+            Enable-IfPresent   $adapter @('RSS','Receive Side Scaling','Receive Side Scaling v2')
+            Enable-IfPresent   $adapter @('RSC (Receive Segment Coalescing)','Receive Segment Coalescing')
+            Set-Buffers        $adapter 1024 1024
+        }
+        'Realtek8126' {
+            Enable-IfPresent   $adapter @('Large Send Offload','Large Send Offload v2 (IPv4)','Large Send Offload v2 (IPv6)')
+            Enable-IfPresent   $adapter @('RSS','Receive Side Scaling')
+            Set-InterruptModeration $adapter 'Low'
+            Disable-IfPresent  $adapter @('Flow Control')
+            Enable-IfPresent   $adapter @('RSC (Receive Segment Coalescing)','Receive Segment Coalescing')
+            Set-Buffers        $adapter 1024 1024
+        }
+        'AQC107' {
+            Enable-IfPresent   $adapter @('RSS','Receive Side Scaling')
+            Enable-IfPresent   $adapter @('RSC (Receive Segment Coalescing)','Receive Segment Coalescing')
+            Set-InterruptModeration $adapter 'Low'
+            Enable-IfPresent   $adapter @('Large Send Offload','Large Send Offload v2 (IPv4)','Large Send Offload v2 (IPv6)')
+            Set-Buffers        $adapter 2048 2048
+        }
+        'Intel2p5G' {
+            Enable-IfPresent   $adapter @('RSS','Receive Side Scaling')
+            Disable-IfPresent  $adapter @('Flow Control')
+            Disable-IfPresent  $adapter @('Energy Efficient Ethernet','EEE')
+            Set-InterruptModeration $adapter 'Low'
+            Enable-IfPresent   $adapter @('Large Send Offload','Large Send Offload v2 (IPv4)','Large Send Offload v2 (IPv6)')
+            Enable-IfPresent   $adapter @('RSC (Receive Segment Coalescing)','Receive Segment Coalescing')
+            if ($adapter.InterfaceDescription -match 'I225') {
+                Disable-IfPresent $adapter @('Large Send Offload','Large Send Offload v2 (IPv4)','Large Send Offload v2 (IPv6)')
+                Disable-IfPresent $adapter @('RSC (Receive Segment Coalescing)','Receive Segment Coalescing')
+            }
+            Disable-IfPresent  $adapter @('Receive Side Coalescing','RSC (Receive Segment Coalescing)')
+            Enable-IfPresent   $adapter @('RSS','Receive Side Scaling')
+            Set-Buffers        $adapter 1024 1024
+            Enable-IfPresent   $adapter @('Large Send Offload v2 (IPv4)','Large Send Offload v2 (IPv6)','Large Send Offload','LSO')
+            Enable-IfPresent   $adapter @('TCP Checksum Offload (IPv4)','TCP Checksum Offload (IPv6)','TCP Checksum Offload','UDP Checksum Offload')
+        }
+        'KillerE3100G' {
+            Apply-AdapterProfile -Preset 'Intel2p5G' -NicName $NicName
+        }
+        'IntelI226' {
+            if ($adapter.InterfaceDescription -notmatch 'I226') { return $false }
+            Disable-IfPresent  $adapter @('Energy-Efficient Ethernet','Energy Efficient Ethernet','EEE')
+            Disable-IfPresent  $adapter @('Flow Control')
+            Set-InterruptModeration $adapter 'Low'
+            Disable-IfPresent  $adapter @('Receive Side Coalescing','RSC (Receive Segment Coalescing)')
+            Enable-IfPresent   $adapter @('RSS','Receive Side Scaling','Receive Side Scaling v2')
+            Set-Buffers        $adapter 1024 1024
+            Enable-IfPresent   $adapter @('Large Send Offload v2 (IPv4)','Large Send Offload v2 (IPv6)','Large Send Offload','LSO')
+            Enable-IfPresent   $adapter @('TCP Checksum Offload (IPv4)','TCP Checksum Offload (IPv6)','TCP Checksum Offload','UDP Checksum Offload')
+        }
+        'IntelI225' {
+            Set-InterruptModeration $adapter 'Low'
+            Enable-IfPresent   $adapter @('RSS','Receive Side Scaling')
+            Set-Buffers        $adapter 1024 1024
+        }
+        default { return $false }
+    }
+    return $true
 }
 
 function Get-MsiKeyPathFromPnp($pnpId) {
@@ -744,7 +885,7 @@ function Reset-RSSPreset {
 }
 
 function Apply-IRQPreset {
-    param([ValidateSet('I226','I225')][string]$Preset,[string]$NicName,[string]$PnpId)
+    param([string]$Preset,[string]$NicName,[string]$PnpId)
     if ([string]::IsNullOrWhiteSpace($NicName)) { return $false }
 
     $cores = [Environment]::ProcessorCount
@@ -755,8 +896,9 @@ function Apply-IRQPreset {
     Backup-MsiIfNeeded -NicName $NicName -MsiKeyPath $msiPath
     if ($msiPath) { Set-Msisupported -MsiKeyPath $msiPath -Value 1 }
 
-    $ok = Apply-RSSPreset -NicName $NicName -BaseCore $base -MaxCore $max
-    return $ok
+    $profileOk = Apply-AdapterProfile -Preset $Preset -NicName $NicName
+    $rssOk = Apply-RSSPreset -NicName $NicName -BaseCore $base -MaxCore $max
+    return ($profileOk -or $rssOk)
 }
 
 function Revert-IRQPreset {
@@ -2284,7 +2426,7 @@ $btn_rssaddsupport.Font          = New-Object System.Drawing.Font('Calibri',9)
 $btn_rssaddsupport.ForeColor     = [System.Drawing.ColorTranslator]::FromHtml("#b8e986")
 
 $Groupbox8                       = New-Object system.Windows.Forms.Groupbox
-$Groupbox8.height                = 584
+$Groupbox8.height                = 720
 $Groupbox8.width                 = 386
 $Groupbox8.text                  = "Tweaks"
 $Groupbox8.location              = New-Object System.Drawing.Point(975,93)
@@ -2949,6 +3091,55 @@ $cb_PriorityBoost.Font           = New-Object System.Drawing.Font('Calibri',9)
 $cb_PriorityBoost.ForeColor      = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
 $cb_PriorityBoost.BackColor      = [System.Drawing.ColorTranslator]::FromHtml("#171717")
 
+$lbl_Tests                       = New-Object system.Windows.Forms.Label
+$lbl_Tests.text                  = "Test"
+$lbl_Tests.AutoSize              = $true
+$lbl_Tests.width                 = 25
+$lbl_Tests.height                = 10
+$lbl_Tests.location              = New-Object System.Drawing.Point(10,530)
+$lbl_Tests.Font                  = New-Object System.Drawing.Font('Calibri',11,[System.Drawing.FontStyle]::Bold)
+$lbl_Tests.ForeColor             = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$btn_TestPing                    = New-Object system.Windows.Forms.Button
+$btn_TestPing.text               = "Ping test (1.1.1.1)"
+$btn_TestPing.width              = 350
+$btn_TestPing.height             = 28
+$btn_TestPing.location           = New-Object System.Drawing.Point(15,550)
+$btn_TestPing.Font               = New-Object System.Drawing.Font('Calibri',10,[System.Drawing.FontStyle]::Bold)
+$btn_TestPing.ForeColor          = $ColorActionText
+$btn_TestPing.BackColor          = $ColorQuickAction
+$btn_TestPing.FlatStyle          = 'Flat'
+
+$btn_TestTraceroute              = New-Object system.Windows.Forms.Button
+$btn_TestTraceroute.text         = "Traceroute (1.1.1.1)"
+$btn_TestTraceroute.width        = 350
+$btn_TestTraceroute.height       = 28
+$btn_TestTraceroute.location     = New-Object System.Drawing.Point(15,585)
+$btn_TestTraceroute.Font         = New-Object System.Drawing.Font('Calibri',10,[System.Drawing.FontStyle]::Bold)
+$btn_TestTraceroute.ForeColor    = $ColorActionText
+$btn_TestTraceroute.BackColor    = $ColorQuickAction
+$btn_TestTraceroute.FlatStyle    = 'Flat'
+
+$btn_TestMtu                     = New-Object system.Windows.Forms.Button
+$btn_TestMtu.text                = "Calcolo MTU"
+$btn_TestMtu.width               = 350
+$btn_TestMtu.height              = 28
+$btn_TestMtu.location            = New-Object System.Drawing.Point(15,620)
+$btn_TestMtu.Font                = New-Object System.Drawing.Font('Calibri',10,[System.Drawing.FontStyle]::Bold)
+$btn_TestMtu.ForeColor           = $ColorActionText
+$btn_TestMtu.BackColor           = $ColorQuickAction
+$btn_TestMtu.FlatStyle           = 'Flat'
+
+$btn_TestBufferbloat             = New-Object system.Windows.Forms.Button
+$btn_TestBufferbloat.text        = "Bufferbloat (waveform.com)"
+$btn_TestBufferbloat.width       = 350
+$btn_TestBufferbloat.height      = 28
+$btn_TestBufferbloat.location    = New-Object System.Drawing.Point(15,655)
+$btn_TestBufferbloat.Font        = New-Object System.Drawing.Font('Calibri',10,[System.Drawing.FontStyle]::Bold)
+$btn_TestBufferbloat.ForeColor   = $ColorActionText
+$btn_TestBufferbloat.BackColor   = $ColorQuickAction
+$btn_TestBufferbloat.FlatStyle   = 'Flat'
+
 $btn_InterruptApply              = New-Object system.Windows.Forms.Button
 $btn_InterruptApply.text         = "Apply"
 $btn_InterruptApply.width        = 60
@@ -2987,7 +3178,7 @@ $Groupbox5.controls.AddRange(@($Label32,$Label33,$cb_tcpiprssbasecpu,$cb_ndisrss
 $Groupbox4.controls.AddRange(@($Label34,$cb_EnablePME,$Label36,$cb_EnableDynamicPowerGating,$Label37,$cb_EnableConnectedPowerGating,$Label38,$cb_AutoPowerSaveModeEnabled,$cb_NicAutoPowerSaver,$Label39,$Label40,$cb_DisableDelayedPowerUp,$Label41,$cb_ReduceSpeedOnPowerDown))
 $Groupbox7.controls.AddRange(@($Label44,$cb_AdvertiseDefaultRoute,$Label45,$cb_Advertising,$Label46,$cb_AutomaticMetric,$cb_ClampMss,$Label47,$cb_DirectedMacWolPattern,$Label48,$Label49,$cb_EcnMarking,$Label50,$cb_ForceArpNdWolPattern,$Label51,$cb_Forwarding,$cb_IgnoreDefaultRoutes,$Label52,$Label53,$cb_ManagedAddressConfiguration,$Label54,$cb_NeighborDiscoverySupported,$Label55,$cb_NeighborUnreachabilityDetection,$Label56,$cb_OtherStatefulConfiguration,$Label57,$cb_RouterDiscovery,$Label58,$cb_Store,$Label59,$cb_WeakHostReceive,$Label60,$cb_WeakHostSend,$Label61,$tb_CurrentHopLimit,$Label62,$tb_BaseReachableTime,$tb_ReachableTime,$Label63,$Label64,$tb_DadRetransmitTime,$Label65,$tb_DadTransmits,$Label66,$tb_NlMtu,$Label67,$tb_RetransmitTime,$Label69,$Label70,$Label71,$Label72))
 $Groupbox6.controls.AddRange(@($lb_MsiMode,$cb_MsiMode,$lb_InterruptPriority,$cb_InterruptPriority,$lb_DevicePolicy,$cb_DevicePolicy))
-$Groupbox8.controls.AddRange(@($Label43,$Label77,$cb_Afd_defaultrecWin,$cb_Afd_defaultSendWin,$Label78,$cb_DisableAddressSharing,$Label79,$cb_DoNotHoldNICBuffers,$Label80,$cb_SmallBufferSize,$Label81,$cb_MediumBufferSize,$Label82,$cb_LargeBufferSize,$Label83,$cb_HugeBufferSize,$cb_BufferAlignment,$Label84,$cb_BufferMultiplier,$Label85,$Label86,$cb_SmallBufferListDepth,$Label87,$cb_MediumBufferListDepth,$Label88,$cb_LargBufferListDepth,$Label89,$cb_DisableChainedReceive,$Label90,$cb_DisableDirectAcceptEx,$Label91,$cb_DisableRawSecurity,$Label92,$cb_DynamicSendBufferDisable,$Label93,$cb_FastSendDatagramThreshold,$Label94,$cb_FastCopyReceiveThreshold,$Label95,$cb_IgnorePushBitOnReceives,$Label96,$cb_IgnoreOrderlyRelease,$Label97,$cb_TransmitWorker,$Label98,$cb_PriorityBoost))
+$Groupbox8.controls.AddRange(@($Label43,$Label77,$cb_Afd_defaultrecWin,$cb_Afd_defaultSendWin,$Label78,$cb_DisableAddressSharing,$Label79,$cb_DoNotHoldNICBuffers,$Label80,$cb_SmallBufferSize,$Label81,$cb_MediumBufferSize,$Label82,$cb_LargeBufferSize,$Label83,$cb_HugeBufferSize,$cb_BufferAlignment,$Label84,$cb_BufferMultiplier,$Label85,$Label86,$cb_SmallBufferListDepth,$Label87,$cb_MediumBufferListDepth,$Label88,$cb_LargBufferListDepth,$Label89,$cb_DisableChainedReceive,$Label90,$cb_DisableDirectAcceptEx,$Label91,$cb_DisableRawSecurity,$Label92,$cb_DynamicSendBufferDisable,$Label93,$cb_FastSendDatagramThreshold,$Label94,$cb_FastCopyReceiveThreshold,$Label95,$cb_IgnorePushBitOnReceives,$Label96,$cb_IgnoreOrderlyRelease,$Label97,$cb_TransmitWorker,$Label98,$cb_PriorityBoost,$lbl_Tests,$btn_TestPing,$btn_TestTraceroute,$btn_TestMtu,$btn_TestBufferbloat))
 
 
 #region Logic 
@@ -3245,10 +3436,28 @@ $btn_MmcssApply.Add_Click({
 
 $btn_AckTweaks.Add_Click({ Show-AckTweaksDialog })
 
+$btn_TestPing.Add_Click({
+    Start-ConsoleTest -Command "ping -n 20 1.1.1.1" -Title "Ping test verso 1.1.1.1 (Cloudflare)"
+})
+
+$btn_TestTraceroute.Add_Click({
+    Start-ConsoleTest -Command "tracert 1.1.1.1" -Title "Traceroute verso 1.1.1.1"
+})
+
+$btn_TestMtu.Add_Click({
+    Start-ConsoleTest -Command "ping -f -l 1472 8.8.8.8" -Title "Test MTU (payload 1472 verso 8.8.8.8)"
+})
+
+$btn_TestBufferbloat.Add_Click({
+    try { Start-Process "https://www.waveform.com/tools/bufferbloat" | Out-Null } catch {
+        [System.Windows.Forms.MessageBox]::Show("Impossibile aprire il browser: $($_.Exception.Message)","Bufferbloat",[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+    }
+})
+
 function Show-SecurityDialog {
     $dlg                 = New-Object System.Windows.Forms.Form
     $dlg.Text            = "Security"
-    $dlg.Size            = New-Object System.Drawing.Size(580,260)
+    $dlg.Size            = New-Object System.Drawing.Size(580,310)
     $dlg.StartPosition   = "CenterParent"
     $dlg.BackColor       = [System.Drawing.ColorTranslator]::FromHtml("#171717")
     $dlg.Font            = New-Object System.Drawing.Font('Calibri',10)
@@ -3572,8 +3781,8 @@ function Show-AckTweaksDialog {
     $dlg.ShowDialog() | Out-Null
 }
 function Show-IrqAffinityDialog {
-    $nicData = Get-NicsForAffinity
-    if ($nicData.Count -eq 0) {
+    $nicData = @(Get-NicsForAffinity)
+    if (-not $nicData -or $nicData.Count -eq 0) {
         [System.Windows.Forms.MessageBox]::Show("Nessuna NIC attiva trovata.","IRQ & Affinity",
             [System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
         return
@@ -3581,7 +3790,7 @@ function Show-IrqAffinityDialog {
 
     $dlg                 = New-Object System.Windows.Forms.Form
     $dlg.Text            = "IRQ & Affinity"
-    $dlg.Size            = New-Object System.Drawing.Size(440,235)
+    $dlg.Size            = New-Object System.Drawing.Size(470,300)
     $dlg.StartPosition   = "CenterParent"
     $dlg.BackColor       = [System.Drawing.ColorTranslator]::FromHtml("#171717")
     $dlg.Font            = New-Object System.Drawing.Font('Calibri',10)
@@ -3598,7 +3807,7 @@ function Show-IrqAffinityDialog {
 
     $cmbNic                   = New-Object System.Windows.Forms.ComboBox
     $cmbNic.Location          = New-Object System.Drawing.Point(120,16)
-    $cmbNic.Size              = New-Object System.Drawing.Size(290,24)
+    $cmbNic.Size              = New-Object System.Drawing.Size(320,24)
     $cmbNic.DropDownStyle     = 'DropDownList'
     foreach ($n in $nicData) { [void]$cmbNic.Items.Add("{0} - {1}" -f $n.Name,$n.IfDesc) }
     if ($cmbNic.Items.Count -gt 0) { $cmbNic.SelectedIndex = 0 }
@@ -3607,27 +3816,33 @@ function Show-IrqAffinityDialog {
     $grpPreset                = New-Object System.Windows.Forms.GroupBox
     $grpPreset.Text           = "Preset"
     $grpPreset.Location       = New-Object System.Drawing.Point(15,55)
-    $grpPreset.Size           = New-Object System.Drawing.Size(395,60)
+    $grpPreset.Size           = New-Object System.Drawing.Size(425,85)
     $grpPreset.ForeColor      = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
     $dlg.Controls.Add($grpPreset)
 
-    $rI226                    = New-Object System.Windows.Forms.RadioButton
-    $rI226.Text               = "Intel I226"
-    $rI226.Location           = New-Object System.Drawing.Point(15,25)
-    $rI226.AutoSize           = $true
-    $rI226.Checked            = $true
-    $grpPreset.Controls.Add($rI226)
+    $presetMap = [ordered]@{
+        'Intel I226'                  = 'IntelI226'
+        'Intel I225 (RSS/MSI only)'   = 'IntelI225'
+        'Intel 2.5G (I219/I225/I226)' = 'Intel2p5G'
+        'Killer E3100G (I225)'        = 'KillerE3100G'
+        'Realtek 8111H (1GbE)'        = 'Realtek8111H'
+        'Realtek 8125 (2.5GbE)'       = 'Realtek8125'
+        'Realtek 8126 (5GbE)'         = 'Realtek8126'
+        'Aquantia/Marvell AQC107'     = 'AQC107'
+    }
 
-    $rI225                    = New-Object System.Windows.Forms.RadioButton
-    $rI225.Text               = "Intel I225"
-    $rI225.Location           = New-Object System.Drawing.Point(120,25)
-    $rI225.AutoSize           = $true
-    $grpPreset.Controls.Add($rI225)
+    $cmbPreset = New-Object System.Windows.Forms.ComboBox
+    $cmbPreset.Location      = New-Object System.Drawing.Point(15,30)
+    $cmbPreset.Size          = New-Object System.Drawing.Size(390,24)
+    $cmbPreset.DropDownStyle = 'DropDownList'
+    foreach ($k in $presetMap.Keys) { [void]$cmbPreset.Items.Add($k) }
+    $cmbPreset.SelectedIndex = 0
+    $grpPreset.Controls.Add($cmbPreset)
 
     $btnApply                 = New-Object System.Windows.Forms.Button
     $btnApply.Text            = "Apply Preset"
     $btnApply.Size            = New-Object System.Drawing.Size(150,30)
-    $btnApply.Location        = New-Object System.Drawing.Point(15,130)
+    $btnApply.Location        = New-Object System.Drawing.Point(15,160)
     $btnApply.ForeColor       = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
     $btnApply.BackColor       = [System.Drawing.ColorTranslator]::FromHtml("#171717")
     $dlg.Controls.Add($btnApply)
@@ -3635,7 +3850,7 @@ function Show-IrqAffinityDialog {
     $btnRevert                = New-Object System.Windows.Forms.Button
     $btnRevert.Text           = "Revert"
     $btnRevert.Size           = New-Object System.Drawing.Size(150,30)
-    $btnRevert.Location       = New-Object System.Drawing.Point(175,130)
+    $btnRevert.Location       = New-Object System.Drawing.Point(175,160)
     $btnRevert.ForeColor      = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
     $btnRevert.BackColor      = [System.Drawing.ColorTranslator]::FromHtml("#171717")
     $dlg.Controls.Add($btnRevert)
@@ -3643,7 +3858,7 @@ function Show-IrqAffinityDialog {
     $btnClose                 = New-Object System.Windows.Forms.Button
     $btnClose.Text            = "Close"
     $btnClose.Size            = New-Object System.Drawing.Size(90,30)
-    $btnClose.Location        = New-Object System.Drawing.Point(320,130)
+    $btnClose.Location        = New-Object System.Drawing.Point(335,160)
     $btnClose.ForeColor       = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
     $btnClose.BackColor       = [System.Drawing.ColorTranslator]::FromHtml("#171717")
     $dlg.Controls.Add($btnClose)
@@ -3652,16 +3867,13 @@ function Show-IrqAffinityDialog {
         $idx = $cmbNic.SelectedIndex
         if ($idx -lt 0) { return }
         $nic = $nicData[$idx]
-        if ($rI226.Checked) {
-            $preset = 'I226'
-        } else {
-            $preset = 'I225'
-        }
+        $presetKey = $cmbPreset.SelectedItem
+        $preset = $presetMap[$presetKey]
         if (Apply-IRQPreset -Preset $preset -NicName $nic.Name -PnpId $nic.PNPDeviceID) {
-            [System.Windows.Forms.MessageBox]::Show(("Preset {0} applicato su '{1}'. (MSI=ON, RSS pinned)" -f $preset,$nic.Name),"OK",
+            [System.Windows.Forms.MessageBox]::Show(("Preset {0} applicato su '{1}'. (MSI=ON, RSS pinned + profilo driver)" -f $presetKey,$nic.Name),"OK",
                 [System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
         } else {
-            [System.Windows.Forms.MessageBox]::Show(("Errore applicando preset {0} su '{1}'." -f $preset,$nic.Name),"Errore",
+            [System.Windows.Forms.MessageBox]::Show(("Errore applicando preset {0} su '{1}'." -f $presetKey,$nic.Name),"Errore",
                 [System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
         }
     })
@@ -3687,7 +3899,7 @@ function Show-IrqAffinityDialog {
 $btn_IrqAffinityDialog.Add_Click({ Show-IrqAffinityDialog })
 
 function Show-NicExtrasDialog {
-    $nics = Get-NicsForExtras
+    $nics = @(Get-NicsForExtras)
     if (-not $nics -or $nics.Count -eq 0) {
         [System.Windows.Forms.MessageBox]::Show("Nessuna NIC rilevata.","NIC Extras",
             [System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
@@ -3696,7 +3908,7 @@ function Show-NicExtrasDialog {
 
     $dlg                 = New-Object System.Windows.Forms.Form
     $dlg.Text            = "NIC Extras"
-    $dlg.Size            = New-Object System.Drawing.Size(520,260)
+    $dlg.Size            = New-Object System.Drawing.Size(520,310)
     $dlg.StartPosition   = "CenterParent"
     $dlg.BackColor       = [System.Drawing.ColorTranslator]::FromHtml("#171717")
     $dlg.Font            = New-Object System.Drawing.Font('Calibri',10)
@@ -3717,7 +3929,7 @@ function Show-NicExtrasDialog {
     $cmbNic.Size     = New-Object System.Drawing.Size(370,24)
     $cmbNic.DropDownStyle = 'DropDownList'
     foreach ($a in $nics) { [void]$cmbNic.Items.Add("{0} - {1}" -f $a.Name,$a.InterfaceDescription) }
-    $cmbNic.SelectedIndex = 0
+    if ($cmbNic.Items.Count -gt 0) { $cmbNic.SelectedIndex = 0 }
     $dlg.Controls.Add($cmbNic)
 
     # Gruppo RSC
