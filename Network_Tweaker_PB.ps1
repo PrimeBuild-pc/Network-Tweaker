@@ -2553,27 +2553,24 @@ $btnSize = $refBtn.Size
 $y       = $refBtn.Location.Y
 $startX  = $btn_Opacity.location.X + $btn_Opacity.width + 8
 
-$btn_BackupSave = New-Object System.Windows.Forms.Button
-$btn_BackupSave.Text = "Backup Save"
-$btn_BackupSave.Size = $btnSize
-$btn_BackupSave.Location = New-Object System.Drawing.Point($startX, $y)
-$btn_BackupSave.FlatStyle = 'Flat'
-$btn_BackupSave.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#FFC20A")
-$btn_BackupSave.ForeColor = [System.Drawing.Color]::Black
-$btn_BackupSave.Cursor    = [System.Windows.Forms.Cursors]::Hand
-$btn_BackupSave.Add_Click({ Invoke-BackupSave })
-$Form.Controls.Add($btn_BackupSave) 
+function New-BackupButton($text,$x,$action) {
+    $btn = New-Object System.Windows.Forms.Button
+    $btn.Text      = $text
+    $btn.Size      = $btnSize
+    $btn.Location  = New-Object System.Drawing.Point($x, $y)
+    $btn.FlatStyle = 'Flat'
+    $btn.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#FFC20A")
+    $btn.ForeColor = [System.Drawing.Color]::Black
+    $btn.Cursor    = [System.Windows.Forms.Cursors]::Hand
+    if ($action) { $btn.Add_Click($action) }
+    $Form.Controls.Add($btn)
+    return $btn
+}
 
-$btn_BackupRestore = New-Object System.Windows.Forms.Button
-$btn_BackupRestore.Text = "Backup Restore"
-$btn_BackupRestore.Size = $btnSize
-$btn_BackupRestore.Location = New-Object System.Drawing.Point(($startX + $btnSize.Width + 8), $y)
-$btn_BackupRestore.FlatStyle = 'Flat'
-$btn_BackupRestore.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#FFC20A")
-$btn_BackupRestore.ForeColor = [System.Drawing.Color]::Black
-$btn_BackupRestore.Cursor    = [System.Windows.Forms.Cursors]::Hand
-$btn_BackupRestore.Add_Click({ Invoke-BackupRestore })
-$Form.Controls.Add($btn_BackupRestore)
+$btn_BackupSave    = New-BackupButton "Backup Save" $startX { Invoke-BackupSave }
+$btn_BackupRestore = New-BackupButton "Backup Restore" ($btn_BackupSave.Location.X + $btnSize.Width + 8) { Invoke-BackupRestore }
+$btn_RestorePoint  = New-BackupButton "Create Restore Point" ($btn_BackupRestore.Location.X + $btnSize.Width + 8) { Invoke-CreateRestorePoint }
+$btn_RegExport     = New-BackupButton "Backup Regedit" ($btn_RestorePoint.Location.X + $btnSize.Width + 8) { Invoke-RegistryBackup }
 
 $Label78                         = New-Object system.Windows.Forms.Label
 $Label78.text                    = "DisableAddressSharing:"
@@ -6071,6 +6068,82 @@ function RegistryTweaks{
 		
 }
 
+function Get-FullBackupSnapshot {
+    if (-not $Global:NetConnectionID) { return $null }
+    if (-not $Global:AddressFamily)  { $Global:AddressFamily = 'IPv4' }
+
+    $ack    = Get-AckValues -NicName $Global:NetConnectionID
+    $iface  = Get-InterfaceSettingsSnapshot
+    $mmcss  = @{ NetworkThrottlingIndex = Get-RegistryDword -Path $MMCSS_Key -Name 'NetworkThrottlingIndex'
+                 SystemResponsiveness   = Get-RegistryDword -Path $MMCSS_Key -Name 'SystemResponsiveness' }
+
+    $msi = $null
+    if ($Global:NewPathInterrupt) {
+        $msiVal   = $null
+        $prioVal  = $null
+        try { $msiVal  = Get-ItemPropertyValue -Path "REGISTRY::$($Global:NewPathInterrupt)\Device Parameters\Interrupt Management\MessageSignaledInterruptProperties" -Name 'MSISupported' -ErrorAction Stop } catch {}
+        try { $prioVal = Get-ItemPropertyValue -Path "REGISTRY::$($Global:NewPathInterrupt)\Device Parameters\Interrupt Management\Affinity Policy" -Name 'DevicePriority' -ErrorAction Stop } catch {}
+        $msi = @{ Path=$Global:NewPathInterrupt; MSISupported=$msiVal; DevicePriority=$prioVal }
+    }
+
+    return [pscustomobject]@{
+        Timestamp      = Get-TimeStamp
+        Alias          = $Global:NetConnectionID
+        AddressFamily  = $Global:AddressFamily
+        Interface      = $iface
+        Ack            = $ack
+        Mmcss          = $mmcss
+        Msi            = $msi
+    }
+}
+
+function Export-RegistryBlock {
+    param([string]$Path,[string]$Destination)
+    if (-not $Path -or -not $Destination) { return $false }
+    if (-not (Test-Path $Path)) { return $false }
+    try {
+        & reg.exe export "$Path" "$Destination" /y | Out-Null
+        return $true
+    } catch { return $false }
+}
+
+function Invoke-RegistryBackup {
+    try {
+        $alias  = if ($Global:NetConnectionID) { $Global:NetConnectionID } else { 'System' }
+        $ts     = Get-TimeStamp
+        $folder = Join-Path $Global:BackupDir $alias
+        if (-not (Test-Path $folder)) { New-Item -Path $folder -ItemType Directory | Out-Null }
+
+        $exported = @()
+        $exported += Export-RegistryBlock -Path $Global:KeyPath -Destination (Join-Path $folder ("NIC_Registry_{0}.reg" -f $ts))
+        $exported += Export-RegistryBlock -Path "HKLM\SYSTEM\CurrentControlSet\Services\AFD\Parameters" -Destination (Join-Path $folder ("AFD_{0}.reg" -f $ts))
+        $exported += Export-RegistryBlock -Path $MMCSS_Key -Destination (Join-Path $folder ("MMCSS_{0}.reg" -f $ts))
+        if ($Global:NewPathInterrupt) {
+            $exported += Export-RegistryBlock -Path $Global:NewPathInterrupt -Destination (Join-Path $folder ("Interrupts_{0}.reg" -f $ts))
+        }
+
+        $msg = if ($exported -contains $true) { "Backup registro creato in:`n$folder" } else { "Nessuna chiave di registro esportata." }
+        [System.Windows.Forms.MessageBox]::Show($msg,"Backup Regedit",
+            [System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show("Export registro fallito: $($_.Exception.Message)","Backup Regedit",
+            [System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+    }
+}
+
+function Invoke-CreateRestorePoint {
+    try {
+        $alias = if ($Global:NetConnectionID) { $Global:NetConnectionID } else { 'NetworkTweaker' }
+        $ts    = Get-TimeStamp
+        Checkpoint-Computer -Description ("PrimeBuild NT RestorePoint {0} {1}" -f $alias,$ts) -RestorePointType MODIFY_SETTINGS | Out-Null
+        [System.Windows.Forms.MessageBox]::Show("Punto di ripristino creato.","Restore Point",
+            [System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show("Impossibile creare il punto di ripristino: $($_.Exception.Message)","Restore Point",
+            [System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+    }
+}
+
 function Invoke-BackupSave {
     try {
         if (-not $Global:NetConnectionID) { throw "Nessuna interfaccia selezionata." }
@@ -6079,20 +6152,13 @@ function Invoke-BackupSave {
         $folder = Join-Path $Global:BackupDir $alias
         if (-not (Test-Path $folder)) { New-Item -Path $folder -ItemType Directory | Out-Null }
 
-        $snap = Get-InterfaceSettingsSnapshot
+        $snap = Get-FullBackupSnapshot
         if ($snap) {
-            $jsonPath = Join-Path $folder ("InterfaceSettings_{0}.json" -f $ts)
-            $snap | ConvertTo-Json -Depth 4 | Set-Content -Encoding UTF8 $jsonPath
+            $jsonPath = Join-Path $folder ("FullBackup_{0}.json" -f $ts)
+            $snap | ConvertTo-Json -Depth 6 | Set-Content -Encoding UTF8 $jsonPath
         }
 
-        if ($Global:KeyPath -and (Test-Path $Global:KeyPath)) {
-            $regPath = Join-Path $folder ("NIC_Registry_{0}.reg" -f $ts)
-            & reg.exe export "$($Global:KeyPath)" "$regPath" /y | Out-Null
-        }
-
-        try {
-            Checkpoint-Computer -Description ("PrimeBuild NT Backup {0} {1}" -f $alias,$ts) -RestorePointType MODIFY_SETTINGS | Out-Null
-        } catch { }
+        Invoke-RegistryBackup
 
         [System.Windows.Forms.MessageBox]::Show("Backup creato in:`n$folder","Backup",
             [System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
@@ -6110,17 +6176,34 @@ function Invoke-BackupRestore {
 
         $ofd = New-Object System.Windows.Forms.OpenFileDialog
         $ofd.InitialDirectory = $folder
-        $ofd.Filter = "Interface Settings (*.json)|*.json|All files (*.*)|*.*"
+        $ofd.Filter = "Backup (*.json)|*.json|All files (*.*)|*.*"
         $ofd.Multiselect = $false
         if ($ofd.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
 
         $snap = Get-Content $ofd.FileName -Raw | ConvertFrom-Json
         if (-not $snap) { throw "File non valido." }
 
-        $Global:AddressFamily   = [string]$snap.AF
-        $Global:NetConnectionID = [string]$snap.Alias
+        if ($snap.Interface) { Apply-InterfaceSettingsFromSnapshot $snap.Interface }
 
-        Apply-InterfaceSettingsFromSnapshot $snap
+        if ($snap.Ack -and $snap.Ack.Path) {
+            foreach ($kv in 'TcpAckFrequency','TCPNoDelay','TcpDelAckTicks') {
+                if ($snap.Ack.PSObject.Properties.Name -contains $kv -and $null -ne $snap.Ack.$kv) {
+                    Set-InterfaceDword -Path $snap.Ack.Path -Name $kv -Value ([uint32]$snap.Ack.$kv)
+                }
+            }
+        }
+
+        if ($snap.Mmcss) {
+            if ($snap.Mmcss.NetworkThrottlingIndex -ne $null) { Set-RegistryDword -Path $MMCSS_Key -Name 'NetworkThrottlingIndex' -Value ([uint32]$snap.Mmcss.NetworkThrottlingIndex) }
+            if ($snap.Mmcss.SystemResponsiveness   -ne $null) { Set-RegistryDword -Path $MMCSS_Key -Name 'SystemResponsiveness'   -Value ([uint32]$snap.Mmcss.SystemResponsiveness) }
+        }
+
+        if ($snap.Msi -and $snap.Msi.Path) {
+            $msiPath = "REGISTRY::$($snap.Msi.Path)\Device Parameters\Interrupt Management\MessageSignaledInterruptProperties"
+            $affPath = "REGISTRY::$($snap.Msi.Path)\Device Parameters\Interrupt Management\Affinity Policy"
+            if ($snap.Msi.MSISupported -ne $null) { Set-RegistryDword -Path $msiPath -Name 'MSISupported' -Value ([uint32]$snap.Msi.MSISupported) }
+            if ($snap.Msi.DevicePriority -ne $null) { Set-RegistryDword -Path $affPath -Name 'DevicePriority' -Value ([uint32]$snap.Msi.DevicePriority) }
+        }
 
         [System.Windows.Forms.MessageBox]::Show("Restore completato (vedi UI).","Restore",
             [System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
