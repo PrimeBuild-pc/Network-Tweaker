@@ -910,7 +910,7 @@ function Revert-IRQPreset {
 }
 
 $Form                            = New-Object system.Windows.Forms.Form
-$Form.ClientSize                 = New-Object System.Drawing.Point(1606,934)
+$Form.ClientSize                 = New-Object System.Drawing.Point(1900,1450)
 $Form.text                       = "Network  Adapter - Tweaker"
 $Form.TopMost                    = $false
 $Form.BackColor                  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
@@ -3026,7 +3026,7 @@ $Groupbox10                       = New-Object system.Windows.Forms.Groupbox
 $Groupbox10.height                = 380
 $Groupbox10.width                 = 230
 $Groupbox10.text                  = "QoS"
-$Groupbox10.location              = New-Object System.Drawing.Point(1365,405)
+$Groupbox10.location              = New-Object System.Drawing.Point(1365,830)
 $Groupbox10.Font                  = New-Object System.Drawing.Font('Calibri',10)
 $Groupbox10.ForeColor             = $ColorPrimary
 
@@ -3111,7 +3111,7 @@ $Groupbox11                       = New-Object system.Windows.Forms.Groupbox
 $Groupbox11.height                = 200
 $Groupbox11.width                 = 260
 $Groupbox11.text                  = "NDIS & MMCSS"
-$Groupbox11.location              = New-Object System.Drawing.Point(1365,790)
+$Groupbox11.location              = New-Object System.Drawing.Point(1365,1225)
 $Groupbox11.Font                  = New-Object System.Drawing.Font('Calibri',10)
 $Groupbox11.ForeColor             = $ColorPrimary
 
