@@ -448,21 +448,31 @@ function New-QoS-AppPair {
     } catch {}
 }
 
+$Global:QoSGamePresets = @(
+    @{ Display='Battlefield 6';     Name='BF6-UDP-Priority';        Exe='bf6.exe' },
+    @{ Display='Fortnite';          Name='QoS-Fortnite';             Exe='FortniteClient-Win64-Shipping.exe' },
+    @{ Display='Marvel Rivals';     Name='QoS-MarvelRivals';         Exe='Marvel-Win64-Shipping.exe' },
+    @{ Display='League of Legends'; Name='QoS-LeagueOfLegends';      Exe='League of Legends.exe' },
+    @{ Display='CS2';               Name='QoS-CS2';                  Exe='cs2.exe' },
+    @{ Display='VALORANT';          Name='QoS-VALORANT';             Exe='VALORANT-Win64-Shipping.exe' },
+    @{ Display='Call of Duty';      Name='QoS-COD';                  Exe='cod.exe' },
+    @{ Display='ARC Raiders';       Name='QoS-ARC-Raiders';          Exe='PioneerGame.exe' }
+)
+
+function Apply-QoS-Preset {
+    param([string]$PresetName)
+    if ([string]::IsNullOrWhiteSpace($PresetName)) { return }
+    $preset = $Global:QoSGamePresets | Where-Object { $_.Display -eq $PresetName } | Select-Object -First 1
+    if (-not $preset) { return }
+    New-QoS-AppPair -NameBase $preset.Name -Exe $preset.Exe -Prio 5 -DSCP 46
+}
+
 function Apply-QoS-BF6 {
-    New-QoS-AppPair -NameBase 'BF6-UDP-Priority' -Exe 'bf6.exe' -Prio 5 -DSCP 46
+    Apply-QoS-Preset -PresetName 'Battlefield 6'
 }
 
 function Apply-QoS-MultiApp {
-    $apps = @(
-        @{ Name='QoS-Fortnite';        Exe='FortniteClient-Win64-Shipping.exe' },
-        @{ Name='QoS-MarvelRivals';    Exe='Marvel-Win64-Shipping.exe' },
-        @{ Name='QoS-LeagueOfLegends'; Exe='League of Legends.exe' },
-        @{ Name='QoS-CS2';             Exe='cs2.exe' },
-        @{ Name='QoS-VALORANT';        Exe='VALORANT-Win64-Shipping.exe' },
-        @{ Name='QoS-COD';             Exe='cod.exe' },
-        @{ Name='QoS-ARC-Raiders';     Exe='PioneerGame.exe' }
-    )
-    foreach ($a in $apps) {
+    foreach ($a in $Global:QoSGamePresets) {
         New-QoS-AppPair -NameBase $a.Name -Exe $a.Exe -Prio 5 -DSCP 46
     }
 }
@@ -765,6 +775,13 @@ $Form.text                       = "Network  Adapter - Tweaker"
 $Form.TopMost                    = $false
 $Form.BackColor                  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
 $Form.AutoScaleMode              = 'Dpi'
+
+$ColorPrimary      = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$ColorSurface      = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+$ColorQuickPreset  = [System.Drawing.ColorTranslator]::FromHtml("#1ec38b")
+$ColorQuickAction  = [System.Drawing.ColorTranslator]::FromHtml("#ffd166")
+$ColorSecurity     = [System.Drawing.ColorTranslator]::FromHtml("#ff8c42")
+$ColorActionText   = [System.Drawing.Color]::FromArgb(20,20,20)
 
 $cb_AdapterNamesCombo            = New-Object system.Windows.Forms.ComboBox
 $cb_AdapterNamesCombo.width      = 262
@@ -2281,7 +2298,7 @@ $Groupbox9.width                 = 230
 $Groupbox9.text                  = "TCP / OS Offloads"
 $Groupbox9.location              = New-Object System.Drawing.Point(1365,93)
 $Groupbox9.Font                  = New-Object System.Drawing.Font('Calibri',10)
-$Groupbox9.ForeColor             = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$Groupbox9.ForeColor             = $ColorPrimary
 
 $lbl_Autotune                    = New-Object system.Windows.Forms.Label
 $lbl_Autotune.AutoSize           = $true
@@ -2296,8 +2313,8 @@ $btn_TcpSafe.width               = 200
 $btn_TcpSafe.height              = 28
 $btn_TcpSafe.location            = New-Object System.Drawing.Point(15,60)
 $btn_TcpSafe.Font                = New-Object System.Drawing.Font('Calibri',10)
-$btn_TcpSafe.ForeColor           = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
-$btn_TcpSafe.BackColor           = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+$btn_TcpSafe.ForeColor           = $ColorActionText
+$btn_TcpSafe.BackColor           = $ColorQuickPreset
 
 $btn_TcpBalanced                 = New-Object system.Windows.Forms.Button
 $btn_TcpBalanced.text            = "Preset: BALANCED"
@@ -2305,8 +2322,8 @@ $btn_TcpBalanced.width           = 200
 $btn_TcpBalanced.height          = 28
 $btn_TcpBalanced.location        = New-Object System.Drawing.Point(15,100)
 $btn_TcpBalanced.Font            = New-Object System.Drawing.Font('Calibri',10)
-$btn_TcpBalanced.ForeColor       = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
-$btn_TcpBalanced.BackColor       = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+$btn_TcpBalanced.ForeColor       = $ColorActionText
+$btn_TcpBalanced.BackColor       = $ColorQuickPreset
 
 $btn_TcpAggressive               = New-Object system.Windows.Forms.Button
 $btn_TcpAggressive.text          = "Preset: AGGRESSIVE"
@@ -2314,8 +2331,8 @@ $btn_TcpAggressive.width         = 200
 $btn_TcpAggressive.height        = 28
 $btn_TcpAggressive.location      = New-Object System.Drawing.Point(15,140)
 $btn_TcpAggressive.Font          = New-Object System.Drawing.Font('Calibri',10)
-$btn_TcpAggressive.ForeColor     = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
-$btn_TcpAggressive.BackColor     = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+$btn_TcpAggressive.ForeColor     = $ColorActionText
+$btn_TcpAggressive.BackColor     = $ColorQuickPreset
 
 $btn_ToggleAutotune              = New-Object system.Windows.Forms.Button
 $btn_ToggleAutotune.text         = "Toggle Auto-Tuning"
@@ -2323,8 +2340,8 @@ $btn_ToggleAutotune.width        = 200
 $btn_ToggleAutotune.height       = 28
 $btn_ToggleAutotune.location     = New-Object System.Drawing.Point(15,190)
 $btn_ToggleAutotune.Font         = New-Object System.Drawing.Font('Calibri',10)
-$btn_ToggleAutotune.ForeColor    = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
-$btn_ToggleAutotune.BackColor    = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+$btn_ToggleAutotune.ForeColor    = $ColorActionText
+$btn_ToggleAutotune.BackColor    = $ColorQuickAction
 
 $btn_IrqAffinityDialog               = New-Object system.Windows.Forms.Button
 $btn_IrqAffinityDialog.text          = "IRQ & Affinity..."
@@ -2360,108 +2377,125 @@ $Groupbox10.width                 = 230
 $Groupbox10.text                  = "QoS"
 $Groupbox10.location              = New-Object System.Drawing.Point(1365,405)
 $Groupbox10.Font                  = New-Object System.Drawing.Font('Calibri',10)
-$Groupbox10.ForeColor             = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$Groupbox10.ForeColor             = $ColorPrimary
+
+$lbl_QoS_Presets                  = New-Object system.Windows.Forms.Label
+$lbl_QoS_Presets.AutoSize         = $true
+$lbl_QoS_Presets.location         = New-Object System.Drawing.Point(15,25)
+$lbl_QoS_Presets.Font             = New-Object System.Drawing.Font('Calibri',10)
+$lbl_QoS_Presets.ForeColor        = $ColorPrimary
+$lbl_QoS_Presets.Text             = "Game presets"
+
+$cb_QoS_Preset                    = New-Object system.Windows.Forms.ComboBox
+$cb_QoS_Preset.width              = 200
+$cb_QoS_Preset.height             = 24
+$cb_QoS_Preset.location           = New-Object System.Drawing.Point(15,45)
+$cb_QoS_Preset.Font               = New-Object System.Drawing.Font('Calibri',10)
+$cb_QoS_Preset.ForeColor          = $ColorPrimary
+$cb_QoS_Preset.BackColor          = $ColorSurface
+foreach ($p in $Global:QoSGamePresets.Display) { [void]$cb_QoS_Preset.Items.Add($p) }
+$cb_QoS_Preset.SelectedIndex = 0
 
 $btn_QoS_BF6                      = New-Object system.Windows.Forms.Button
-$btn_QoS_BF6.text                 = "Apply BF6"
+$btn_QoS_BF6.text                 = "Apply preset"
 $btn_QoS_BF6.width                = 200
 $btn_QoS_BF6.height               = 28
-$btn_QoS_BF6.location             = New-Object System.Drawing.Point(15,25)
-$btn_QoS_BF6.Font                 = New-Object System.Drawing.Font('Calibri',10)
-$btn_QoS_BF6.ForeColor            = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
-$btn_QoS_BF6.BackColor            = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+$btn_QoS_BF6.location             = New-Object System.Drawing.Point(15,75)
+$btn_QoS_BF6.Font                 = New-Object System.Drawing.Font('Calibri',10,[System.Drawing.FontStyle]::Bold)
+$btn_QoS_BF6.ForeColor            = $ColorActionText
+$btn_QoS_BF6.BackColor            = $ColorQuickPreset
 
 $btn_QoS_Multi                    = New-Object system.Windows.Forms.Button
-$btn_QoS_Multi.text               = "Apply Multi-App"
+$btn_QoS_Multi.text               = "Apply All"
 $btn_QoS_Multi.width              = 200
 $btn_QoS_Multi.height             = 28
-$btn_QoS_Multi.location           = New-Object System.Drawing.Point(15,63)
-$btn_QoS_Multi.Font               = New-Object System.Drawing.Font('Calibri',10)
-$btn_QoS_Multi.ForeColor          = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
-$btn_QoS_Multi.BackColor          = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+$btn_QoS_Multi.location           = New-Object System.Drawing.Point(15,110)
+$btn_QoS_Multi.Font               = New-Object System.Drawing.Font('Calibri',10,[System.Drawing.FontStyle]::Bold)
+$btn_QoS_Multi.ForeColor          = $ColorActionText
+$btn_QoS_Multi.BackColor          = $ColorQuickAction
 
 $btn_QoS_Custom                   = New-Object system.Windows.Forms.Button
-$btn_QoS_Custom.text              = "Custom
-2026"
+$btn_QoS_Custom.text              = "Custom"
 $btn_QoS_Custom.width             = 95
 $btn_QoS_Custom.height            = 28
-$btn_QoS_Custom.location          = New-Object System.Drawing.Point(15,101)
+$btn_QoS_Custom.location          = New-Object System.Drawing.Point(15,145)
 $btn_QoS_Custom.Font              = New-Object System.Drawing.Font('Calibri',10)
-$btn_QoS_Custom.ForeColor         = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
-$btn_QoS_Custom.BackColor         = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+$btn_QoS_Custom.ForeColor         = $ColorPrimary
+$btn_QoS_Custom.BackColor         = $ColorSurface
 
 $btn_QoS_Remove                   = New-Object system.Windows.Forms.Button
 $btn_QoS_Remove.text              = "Remove All"
 $btn_QoS_Remove.width             = 95
 $btn_QoS_Remove.height            = 28
-$btn_QoS_Remove.location          = New-Object System.Drawing.Point(120,101)
+$btn_QoS_Remove.location          = New-Object System.Drawing.Point(120,145)
 $btn_QoS_Remove.Font              = New-Object System.Drawing.Font('Calibri',10)
-$btn_QoS_Remove.ForeColor         = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
-$btn_QoS_Remove.BackColor         = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+$btn_QoS_Remove.ForeColor         = $ColorPrimary
+$btn_QoS_Remove.BackColor         = $ColorSurface
+
+$btn_Security                     = New-Object system.Windows.Forms.Button
+$btn_Security.text                = "Security Center"
+$btn_Security.width               = 200
+$btn_Security.height              = 28
+$btn_Security.location            = New-Object System.Drawing.Point(15,180)
+$btn_Security.Font                = New-Object System.Drawing.Font('Calibri',10,[System.Drawing.FontStyle]::Bold)
+$btn_Security.ForeColor           = $ColorActionText
+$btn_Security.BackColor           = $ColorSecurity
 
 $lbl_QoS_List                     = New-Object system.Windows.Forms.Label
 $lbl_QoS_List.AutoSize            = $true
-$lbl_QoS_List.location            = New-Object System.Drawing.Point(15,150)
+$lbl_QoS_List.location            = New-Object System.Drawing.Point(15,220)
 $lbl_QoS_List.Font                = New-Object System.Drawing.Font('Calibri',10)
-$lbl_QoS_List.ForeColor           = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$lbl_QoS_List.ForeColor           = $ColorPrimary
 $lbl_QoS_List.Text                = "Active policies (ActiveStore):"
 
 $lst_QoS                          = New-Object System.Windows.Forms.ListBox
-$lst_QoS.location                 = New-Object System.Drawing.Point(15,170)
-$lst_QoS.size                     = New-Object System.Drawing.Size(200,190)
+$lst_QoS.location                 = New-Object System.Drawing.Point(15,240)
+$lst_QoS.size                     = New-Object System.Drawing.Size(200,120)
 $lst_QoS.Font                     = New-Object System.Drawing.Font('Calibri',10)
-$lst_QoS.ForeColor                = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
-$lst_QoS.BackColor                = [System.Drawing.ColorTranslator]::FromHtml("#171717")
-
-# --- Link "Security..." nel Groupbox10 (QoS) ---
-$lnk_Security = New-Object System.Windows.Forms.LinkLabel
-$lnk_Security.Text = "Security..."
-$lnk_Security.AutoSize = $true
-$lnk_Security.Location = New-Object System.Drawing.Point(15,130)
-$lnk_Security.LinkColor = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
-$Groupbox10.Controls.Add($lnk_Security)
+$lst_QoS.ForeColor                = $ColorPrimary
+$lst_QoS.BackColor                = $ColorSurface
 
 # === Groupbox11: NDIS & MMCSS ===
 $Groupbox11                       = New-Object system.Windows.Forms.Groupbox
-$Groupbox11.height                = 180
+$Groupbox11.height                = 200
 $Groupbox11.width                 = 260
 $Groupbox11.text                  = "NDIS & MMCSS"
 $Groupbox11.location              = New-Object System.Drawing.Point(1365,790)
 $Groupbox11.Font                  = New-Object System.Drawing.Font('Calibri',10)
-$Groupbox11.ForeColor             = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$Groupbox11.ForeColor             = $ColorPrimary
 
 $lbl_Mmcss                        = New-Object system.Windows.Forms.Label
 $lbl_Mmcss.AutoSize               = $true
 $lbl_Mmcss.location               = New-Object System.Drawing.Point(15,25)
 $lbl_Mmcss.Font                   = New-Object System.Drawing.Font('Calibri',10)
-$lbl_Mmcss.ForeColor              = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$lbl_Mmcss.ForeColor              = $ColorPrimary
 $lbl_Mmcss.Text                   = Get-MmcssStatusText
 
 $btn_AckTweaks = New-Object System.Windows.Forms.Button
 $btn_AckTweaks.Text = "ACK Tweaks"
-$btn_AckTweaks.Size = New-Object System.Drawing.Size(110,26)
-$btn_AckTweaks.Location = New-Object System.Drawing.Point(150,22)
+$btn_AckTweaks.Size = New-Object System.Drawing.Size(230,28)
+$btn_AckTweaks.Location = New-Object System.Drawing.Point(15,45)
 $btn_AckTweaks.FlatStyle = 'Flat'
-$btn_AckTweaks.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#171717")
-$btn_AckTweaks.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$btn_AckTweaks.BackColor = $ColorQuickAction
+$btn_AckTweaks.ForeColor = $ColorActionText
 
 $btn_MmcssApply                   = New-Object system.Windows.Forms.Button
 $btn_MmcssApply.text              = "Apply Optimizations"
-$btn_MmcssApply.width             = 240
+$btn_MmcssApply.width             = 230
 $btn_MmcssApply.height            = 28
-$btn_MmcssApply.location          = New-Object System.Drawing.Point(15,50)
-$btn_MmcssApply.Font              = New-Object System.Drawing.Font('Calibri',10)
-$btn_MmcssApply.ForeColor         = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
-$btn_MmcssApply.BackColor         = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+$btn_MmcssApply.location          = New-Object System.Drawing.Point(15,80)
+$btn_MmcssApply.Font              = New-Object System.Drawing.Font('Calibri',10,[System.Drawing.FontStyle]::Bold)
+$btn_MmcssApply.ForeColor         = $ColorActionText
+$btn_MmcssApply.BackColor         = $ColorQuickPreset
 
 $btn_MmcssRevert                  = New-Object system.Windows.Forms.Button
 $btn_MmcssRevert.text             = "Revert"
 $btn_MmcssRevert.width            = 230
 $btn_MmcssRevert.height           = 28
-$btn_MmcssRevert.location         = New-Object System.Drawing.Point(15,88)
+$btn_MmcssRevert.location         = New-Object System.Drawing.Point(15,115)
 $btn_MmcssRevert.Font             = New-Object System.Drawing.Font('Calibri',10)
-$btn_MmcssRevert.ForeColor        = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
-$btn_MmcssRevert.BackColor        = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+$btn_MmcssRevert.ForeColor        = $ColorPrimary
+$btn_MmcssRevert.BackColor        = $ColorSurface
 
 $Label43                         = New-Object system.Windows.Forms.Label
 $Label43.text                    = "DefaultReceiveWindow:"
@@ -2947,8 +2981,8 @@ $cb_CoalesceBufferSize.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("
 $cb_CoalesceBufferSize.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
 
 $Groupbox9.controls.AddRange(@($lbl_Autotune,$btn_TcpSafe,$btn_TcpBalanced,$btn_TcpAggressive,$btn_ToggleAutotune,$btn_IrqAffinityDialog,$btn_NicExtrasDialog))
-$Groupbox10.controls.AddRange(@($btn_QoS_BF6,$btn_QoS_Multi,$btn_QoS_Custom,$btn_QoS_Remove,$lbl_QoS_List,$lst_QoS))
-$Groupbox11.controls.AddRange(@($lbl_Mmcss,$btn_MmcssApply,$btn_MmcssRevert,$btn_AckTweaks))
+$Groupbox10.controls.AddRange(@($lbl_QoS_Presets,$cb_QoS_Preset,$btn_QoS_BF6,$btn_QoS_Multi,$btn_QoS_Custom,$btn_QoS_Remove,$btn_Security,$lbl_QoS_List,$lst_QoS))
+$Groupbox11.controls.AddRange(@($lbl_Mmcss,$btn_AckTweaks,$btn_MmcssApply,$btn_MmcssRevert))
 
 $Form.controls.AddRange(@($cb_AdapterNamesCombo,$Label1,$Label2,$lbl_Path,$Label3,$lbl_ndisver,$Groupbox1,$btn_apply,$btn_unqueues,$btn_openreg,$Groupbox2,$btn_applyglobal,$Groupbox3,$btn_applyadv,$btn_adaptrest,$Groupbox5,$Groupbox4,$btn_applypowersettings,$Groupbox7,$btn_applyall,$Groupbox6,$btn_applyInterfaceSettings,$cb_IPv6,$cb_IPv4,$btn_rssaddsupport,$Groupbox8,$btn_registrytweaksapply,$btn_Opacity,$btn_InterruptApply,$Groupbox9,$Groupbox10,$Groupbox11))
 $Groupbox1.controls.AddRange(@($Label4,$Label5,$Label6,$lbl_rssstatus,$cb_rss_onoff,$cb_rssqueues,$cb_rssprofile,$Label7,$cb_rssbaseproc,$Label8,$cb_rssmaxproc,$Label9,$cb_rssmaxprocs,$Label35,$cb_DisablePortScaling,$Label42,$cb_ManyCoreScaling))
@@ -3010,11 +3044,11 @@ $Groupbox6.ForeColor           = [System.Drawing.ColorTranslator]::FromHtml("#4a
 $Groupbox8.Font                = New-Object System.Drawing.Font('Calibri',10)
 $Groupbox8.ForeColor           = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
 $Groupbox9.Font                = New-Object System.Drawing.Font('Calibri',10)
-$Groupbox9.ForeColor           = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$Groupbox9.ForeColor           = $ColorPrimary
 $Groupbox10.Font               = New-Object System.Drawing.Font('Calibri',10)
-$Groupbox10.ForeColor          = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$Groupbox10.ForeColor          = $ColorPrimary
 $Groupbox11.Font               = New-Object System.Drawing.Font('Calibri',10)
-$Groupbox11.ForeColor          = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$Groupbox11.ForeColor          = $ColorPrimary
 
 
 #Buttons
@@ -3039,10 +3073,12 @@ $btn_QoS_BF6.Flatstyle = 'Flat'
 $btn_QoS_Multi.Flatstyle = 'Flat'
 $btn_QoS_Custom.Flatstyle = 'Flat'
 $btn_QoS_Remove.Flatstyle = 'Flat'
+$btn_Security.Flatstyle = 'Flat'
 $btn_InterruptApply.Flatstyle = 'Flat'
 $btn_IrqAffinityDialog.Flatstyle = 'Flat'
 $btn_MmcssApply.Flatstyle = 'Flat'
 $btn_MmcssRevert.Flatstyle = 'Flat'
+$btn_AckTweaks.FlatStyle = 'Flat'
 
 $btn_TcpSafe.Add_Click({
     Set-TcpPreset -Preset 'SAFE'
@@ -3064,7 +3100,9 @@ $btn_ToggleAutotune.Add_Click({
 Add-Type -AssemblyName Microsoft.VisualBasic | Out-Null
 
 $btn_QoS_BF6.Add_Click({
-    Apply-QoS-BF6
+    $sel = $cb_QoS_Preset.SelectedItem
+    if ([string]::IsNullOrWhiteSpace($sel)) { return }
+    Apply-QoS-Preset -PresetName $sel
     Refresh-QoSListBox -ListBox $lst_QoS
 })
 
@@ -3090,6 +3128,8 @@ $btn_QoS_Remove.Add_Click({
         Refresh-QoSListBox -ListBox $lst_QoS
     }
 })
+
+$btn_Security.Add_Click({ Show-SecurityDialog })
 
 Refresh-QoSListBox -ListBox $lst_QoS
 
@@ -3191,7 +3231,6 @@ function Show-SecurityDialog {
     $dlg.ShowDialog() | Out-Null
 }
 
-$lnk_Security.Add_Click({ Show-SecurityDialog })
 
 function Show-RevertCenterDialog {
     $dlg                 = New-Object System.Windows.Forms.Form
