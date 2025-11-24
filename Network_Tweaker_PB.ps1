@@ -1758,6 +1758,82 @@ $cb_ReduceSpeedOnPowerDown.Font  = New-Object System.Drawing.Font('Calibri',9)
 $cb_ReduceSpeedOnPowerDown.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
 $cb_ReduceSpeedOnPowerDown.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
 
+$Label_pss                        = New-Object system.Windows.Forms.Label
+$Label_pss.text                   = "SelectiveSuspend (Global):"
+$Label_pss.AutoSize               = $true
+$Label_pss.width                  = 25
+$Label_pss.height                 = 10
+$Label_pss.location               = New-Object System.Drawing.Point(9,172)
+$Label_pss.Font                   = New-Object System.Drawing.Font('Calibri',10)
+$Label_pss.ForeColor              = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_DefaultSelectiveSuspend       = New-Object system.Windows.Forms.ComboBox
+$cb_DefaultSelectiveSuspend.width  = 108
+$cb_DefaultSelectiveSuspend.height  = 20
+@('Disabled','Enabled','Skip') | ForEach-Object {[void] $cb_DefaultSelectiveSuspend.Items.Add($_)}
+$cb_DefaultSelectiveSuspend.location  = New-Object System.Drawing.Point(204,169)
+$cb_DefaultSelectiveSuspend.Font  = New-Object System.Drawing.Font('Calibri',9)
+$cb_DefaultSelectiveSuspend.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_DefaultSelectiveSuspend.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+$cb_DefaultSelectiveSuspend.Text   = 'Skip'
+
+$Label_aspm                       = New-Object system.Windows.Forms.Label
+$Label_aspm.text                  = "PCIe ASPM (L1):"
+$Label_aspm.AutoSize              = $true
+$Label_aspm.width                 = 25
+$Label_aspm.height                = 10
+$Label_aspm.location              = New-Object System.Drawing.Point(9,194)
+$Label_aspm.Font                  = New-Object System.Drawing.Font('Calibri',10)
+$Label_aspm.ForeColor             = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_PcieAspm                     = New-Object system.Windows.Forms.ComboBox
+$cb_PcieAspm.width               = 108
+$cb_PcieAspm.height              = 20
+@('Off','Moderate','Maximum','Skip') | ForEach-Object {[void] $cb_PcieAspm.Items.Add($_)}
+$cb_PcieAspm.location            = New-Object System.Drawing.Point(204,191)
+$cb_PcieAspm.Font                = New-Object System.Drawing.Font('Calibri',9)
+$cb_PcieAspm.ForeColor           = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_PcieAspm.BackColor           = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+$cb_PcieAspm.Text                = 'Skip'
+
+$Label_devSleep                  = New-Object system.Windows.Forms.Label
+$Label_devSleep.text             = "Allow device power saving:"
+$Label_devSleep.AutoSize         = $true
+$Label_devSleep.width            = 25
+$Label_devSleep.height           = 10
+$Label_devSleep.location         = New-Object System.Drawing.Point(9,216)
+$Label_devSleep.Font             = New-Object System.Drawing.Font('Calibri',10)
+$Label_devSleep.ForeColor        = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_DevicePowerSaving            = New-Object system.Windows.Forms.ComboBox
+$cb_DevicePowerSaving.width      = 108
+$cb_DevicePowerSaving.height     = 20
+@('Disabled','Enabled','Skip') | ForEach-Object {[void] $cb_DevicePowerSaving.Items.Add($_)}
+$cb_DevicePowerSaving.location   = New-Object System.Drawing.Point(204,213)
+$cb_DevicePowerSaving.Font       = New-Object System.Drawing.Font('Calibri',9)
+$cb_DevicePowerSaving.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_DevicePowerSaving.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+$cb_DevicePowerSaving.Text       = 'Skip'
+
+$Label_allowWake                 = New-Object system.Windows.Forms.Label
+$Label_allowWake.text            = "Allow wake:"
+$Label_allowWake.AutoSize        = $true
+$Label_allowWake.width           = 25
+$Label_allowWake.height          = 10
+$Label_allowWake.location        = New-Object System.Drawing.Point(9,238)
+$Label_allowWake.Font            = New-Object System.Drawing.Font('Calibri',10)
+$Label_allowWake.ForeColor       = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_AllowWake                    = New-Object system.Windows.Forms.ComboBox
+$cb_AllowWake.width              = 108
+$cb_AllowWake.height             = 20
+@('Disabled','Enabled','Skip') | ForEach-Object {[void] $cb_AllowWake.Items.Add($_)}
+$cb_AllowWake.location           = New-Object System.Drawing.Point(204,235)
+$cb_AllowWake.Font               = New-Object System.Drawing.Font('Calibri',9)
+$cb_AllowWake.ForeColor          = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_AllowWake.BackColor          = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+$cb_AllowWake.Text               = 'Skip'
+
 $Label35                         = New-Object system.Windows.Forms.Label
 $Label35.text                    = "DisablePortScaling:"
 $Label35.AutoSize                = $true
@@ -3718,7 +3794,19 @@ $Groupbox1.controls.AddRange(@($Label4,$Label5,$Label6,$lbl_rssstatus,$cb_rss_on
 $Groupbox2.controls.AddRange(@($Label10,$cb_osrss,$Label11,$cb_osrsc,$Label12,$cb_oschimney,$Label13,$cb_ostaskoff,$cb_osntd,$Label14,$cb_osntdais,$Label15,$cb_ospcf,$Label16))
 $Groupbox3.controls.AddRange(@($Label17,$cb_flowcontrol,$Label18,$Label19,$Label20,$Label21,$Label22,$Label23,$cb_InterruptModeration,$cb_IPChecksumOffloadIPv4,$cb_TCPChecksumOffloadIPv4,$cb_TCPChecksumOffloadIPv6,$cb_UDPChecksumOffloadIPv4,$cb_UDPChecksumOffloadIPv6,$Label24,$cb_InterruptModerationRate,$Label25,$Label26,$cb_LsoV2IPv4,$cb_LsoV2IPv6,$Label27,$cb_LsoV1IPv4,$Label28,$cb_PMNSOffload,$Label29,$cb_PMARPOffload,$cb_PriorityVLANTag,$Label00,$Label30,$cb_ReceiveBuffers,$Label31,$cb_TransmitBuffers,$Label73,$tb_TxIntDelay,$Label74,$cb_PacketDirect,$Label75,$cb_EnableCoalesce,$Label76,$cb_EnableUdpTxScaling,$Label68,$cb_CoalesceBufferSize))
 $Groupbox5.controls.AddRange(@($Label32,$Label33,$cb_tcpiprssbasecpu,$cb_ndisrssbasecpu))
-$Groupbox4.controls.AddRange(@($Label34,$cb_EnablePME,$Label36,$cb_EnableDynamicPowerGating,$Label37,$cb_EnableConnectedPowerGating,$Label38,$cb_AutoPowerSaveModeEnabled,$cb_NicAutoPowerSaver,$Label39,$Label40,$cb_DisableDelayedPowerUp,$Label41,$cb_ReduceSpeedOnPowerDown))
+$Groupbox4.controls.AddRange(@(
+    $Label34,$cb_EnablePME,
+    $Label36,$cb_EnableDynamicPowerGating,
+    $Label37,$cb_EnableConnectedPowerGating,
+    $Label38,$cb_AutoPowerSaveModeEnabled,
+    $cb_NicAutoPowerSaver,
+    $Label39,$Label40,$cb_DisableDelayedPowerUp,
+    $Label41,$cb_ReduceSpeedOnPowerDown,
+    $Label_pss,$cb_DefaultSelectiveSuspend,
+    $Label_aspm,$cb_PcieAspm,
+    $Label_devSleep,$cb_DevicePowerSaving,
+    $Label_allowWake,$cb_AllowWake
+))
 $Groupbox7.controls.AddRange(@($Label44,$cb_AdvertiseDefaultRoute,$Label45,$cb_Advertising,$Label46,$cb_AutomaticMetric,$cb_ClampMss,$Label47,$cb_DirectedMacWolPattern,$Label48,$Label49,$cb_EcnMarking,$Label50,$cb_ForceArpNdWolPattern,$Label51,$cb_Forwarding,$cb_IgnoreDefaultRoutes,$Label52,$Label53,$cb_ManagedAddressConfiguration,$Label54,$cb_NeighborDiscoverySupported,$Label55,$cb_NeighborUnreachabilityDetection,$Label56,$cb_OtherStatefulConfiguration,$Label57,$cb_RouterDiscovery,$Label58,$cb_Store,$Label59,$cb_WeakHostReceive,$Label60,$cb_WeakHostSend,$Label61,$tb_CurrentHopLimit,$Label62,$tb_BaseReachableTime,$tb_ReachableTime,$Label63,$Label64,$tb_DadRetransmitTime,$Label65,$tb_DadTransmits,$Label66,$tb_NlMtu,$Label67,$tb_RetransmitTime,$Label69,$Label70,$Label71,$Label72))
 $Groupbox6.controls.AddRange(@($lb_MsiMode,$cb_MsiMode,$lb_InterruptPriority,$cb_InterruptPriority,$lb_DevicePolicy,$cb_DevicePolicy))
 $Groupbox8.controls.AddRange(@($Label43,$Label77,$cb_Afd_defaultrecWin,$cb_Afd_defaultSendWin,$Label78,$cb_DisableAddressSharing,$Label79,$cb_DoNotHoldNICBuffers,$Label80,$cb_SmallBufferSize,$Label81,$cb_MediumBufferSize,$Label82,$cb_LargeBufferSize,$Label83,$cb_HugeBufferSize,$cb_BufferAlignment,$Label84,$cb_BufferMultiplier,$Label85,$Label86,$cb_SmallBufferListDepth,$Label87,$cb_MediumBufferListDepth,$Label88,$cb_LargBufferListDepth,$Label89,$cb_DisableChainedReceive,$Label90,$cb_DisableDirectAcceptEx,$Label91,$cb_DisableRawSecurity,$Label92,$cb_DynamicSendBufferDisable,$Label93,$cb_FastSendDatagramThreshold,$Label94,$cb_FastCopyReceiveThreshold,$Label95,$cb_IgnorePushBitOnReceives,$Label96,$cb_IgnoreOrderlyRelease,$Label97,$cb_TransmitWorker,$Label98,$cb_PriorityBoost,$lbl_Tests,$btn_TestPing,$btn_TestTraceroute,$btn_TestMtu,$btn_TestBufferbloat))
@@ -5282,7 +5370,57 @@ function UpdateNicContext {
                 $cb_ReduceSpeedOnPowerDown.Items.Add('Undeclared')
                 $cb_ReduceSpeedOnPowerDown.Text = 'Undeclared'
             }
-            
+
+        #DefaultSelectiveSuspend (global)
+        try {
+            $dss = (Get-ItemPropertyValue -Path "HKLM:\\SYSTEM\\CurrentControlSet\\Services\\NDIS\\Parameters" -Name "DefaultSelectiveSuspend" -ErrorAction Stop)
+            if ($dss -eq 0 -or $dss -eq 1) {
+                $cb_DefaultSelectiveSuspend.SelectedIndex = $dss
+            } else {
+                $cb_DefaultSelectiveSuspend.Text = 'Skip'
+            }
+        } catch {
+            $cb_DefaultSelectiveSuspend.Text = 'Skip'
+        }
+
+        #PCIe ASPM (current plan)
+        try {
+            $aspmIndex = powercfg -getactivescheme | Select-String -Pattern '{.*}' | ForEach-Object { $_.Matches.Value }
+            $aspmValue = if ($aspmIndex) { powercfg -query $aspmIndex SUB_PCIEXPRESS ASPM | Select-String -Pattern '\\(0x[0-9]+\\)' | Select-Object -First 1 | ForEach-Object { $_.Matches.Value } }
+            switch ($aspmValue) {
+                '(0x0)' { $cb_PcieAspm.SelectedIndex = 0 }
+                '(0x1)' { $cb_PcieAspm.SelectedIndex = 1 }
+                '(0x2)' { $cb_PcieAspm.SelectedIndex = 2 }
+                default { $cb_PcieAspm.Text = 'Skip' }
+            }
+        } catch {
+            $cb_PcieAspm.Text = 'Skip'
+        }
+
+        #Allow device power saving
+        try {
+            $pm = Get-NetAdapterPowerManagement -Name $Global:NetConnectionID -ErrorAction Stop
+            if ($pm.AllowComputerToTurnOffDevice -eq $true) {
+                $cb_DevicePowerSaving.SelectedIndex = 1
+            } elseif ($pm.AllowComputerToTurnOffDevice -eq $false) {
+                $cb_DevicePowerSaving.SelectedIndex = 0
+            }
+        } catch {
+            $cb_DevicePowerSaving.Text = 'Skip'
+        }
+
+        #Allow wake
+        try {
+            $wake = powercfg -devicequery wake_armed
+            if ($wake -and ($wake -contains $Global:NetConnectionID)) {
+                $cb_AllowWake.SelectedIndex = 1
+            } elseif ($wake) {
+                $cb_AllowWake.SelectedIndex = 0
+            }
+        } catch {
+            $cb_AllowWake.Text = 'Skip'
+        }
+
         #DisablePortScaling
         $DisablePortScaling = (Get-ItemPropertyValue -Path "$KeyPath" -Name "DisablePortScaling")
             if ($DisablePortScaling -eq 0 -or $DisablePortScaling -eq 1 ){
@@ -5919,6 +6057,70 @@ function RSSEnable{
                 
 }
 
+        function Set-SelectiveSuspendGlobal {
+            param([string]$Mode)
+            $path = "HKLM:\SYSTEM\CurrentControlSet\Services\NDIS\Parameters"
+            if ($Mode -eq 'Skip') { return }
+            $value = if ($Mode -eq 'Disabled') { 0 } else { 1 }
+            try {
+                New-Item -Path $path -Force | Out-Null
+                New-ItemProperty -Path $path -Name 'DefaultSelectiveSuspend' -PropertyType DWord -Value $value -Force | Out-Null
+                Write-Host "Selective Suspend set to $Mode" -ForegroundColor Green
+            } catch {
+                Write-Warning "Impossibile impostare Selective Suspend: $($_.Exception.Message)"
+            }
+        }
+
+        function Set-PcieAspmPolicy {
+            param([string]$Mode)
+            if ($Mode -eq 'Skip') { return }
+            $value = switch ($Mode) {
+                'Off'      { 0 }
+                'Moderate' { 1 }
+                'Maximum'  { 2 }
+                default    { return }
+            }
+            foreach ($scheme in 'SCHEME_CURRENT') {
+                try {
+                    powercfg -setacvalueindex $scheme SUB_PCIEXPRESS ASPM $value | Out-Null
+                    powercfg -setdcvalueindex $scheme SUB_PCIEXPRESS ASPM $value | Out-Null
+                    powercfg -SetActive $scheme | Out-Null
+                    Write-Host "PCIe ASPM ($Mode) applicato con powercfg" -ForegroundColor Green
+                } catch {
+                    Write-Warning "Errore impostando ASPM: $($_.Exception.Message)"
+                }
+            }
+        }
+
+        function Set-NicPowerSavingState {
+            param([string]$Mode)
+            if ($Mode -eq 'Skip' -or -not $Global:NetConnectionID) { return }
+            $allow = ($Mode -eq 'Enabled')
+            try {
+                Set-NetAdapterPowerManagement -Name $Global:NetConnectionID -AllowComputerToTurnOffDevice $allow -ErrorAction Stop | Out-Null
+                $state = if ($allow) { 'abilitato' } else { 'disabilitato' }
+                Write-Host "Power saving sul dispositivo $state" -ForegroundColor Green
+            } catch {
+                Write-Warning "Impossibile aggiornare PowerSaving per $($Global:NetConnectionID): $($_.Exception.Message)"
+            }
+        }
+
+        function Set-NicWakeState {
+            param([string]$Mode)
+            if ($Mode -eq 'Skip' -or -not $Global:NetConnectionID) { return }
+            try {
+                if ($Mode -eq 'Enabled') {
+                    powercfg -deviceenablewake $Global:NetConnectionID | Out-Null
+                    Write-Host "Wake abilitato per $($Global:NetConnectionID)" -ForegroundColor Green
+                } elseif ($Mode -eq 'Disabled') {
+                    powercfg -devicedisablewake $Global:NetConnectionID | Out-Null
+                    Write-Host "Wake disabilitato per $($Global:NetConnectionID)" -ForegroundColor Green
+                }
+            } catch {
+                Write-Warning "Impossibile aggiornare wake per $($Global:NetConnectionID): $($_.Exception.Message)"
+            }
+        }
+
         function applypowersavingsettings {
             #cls
             # ========================================================
@@ -5994,8 +6196,13 @@ function RSSEnable{
             New-ItemProperty -Path "$KeyPath" -Name "ReduceSpeedOnPowerDown" -PropertyType DWORD -Value "1" -Force}
             if ($cb_ReduceSpeedOnPowerDown.SelectedIndex -eq '2'){
             Write-Host "Skipping ReduceSpeedOnPowerDown" -ForegroundColor Green}
-            
-            
+
+            Set-SelectiveSuspendGlobal -Mode $cb_DefaultSelectiveSuspend.Text
+            Set-PcieAspmPolicy -Mode $cb_PcieAspm.Text
+            Set-NicPowerSavingState -Mode $cb_DevicePowerSaving.Text
+            Set-NicWakeState -Mode $cb_AllowWake.Text
+
+
         }
 
         #Adding more then Default RSSQueues
