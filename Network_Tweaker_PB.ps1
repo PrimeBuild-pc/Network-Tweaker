@@ -910,7 +910,7 @@ function Revert-IRQPreset {
 }
 
 $Form                            = New-Object system.Windows.Forms.Form
-$Form.ClientSize                 = New-Object System.Drawing.Point(1606,934)
+$Form.ClientSize                 = New-Object System.Drawing.Point(1900,1450)
 $Form.text                       = "Network  Adapter - Tweaker"
 $Form.TopMost                    = $false
 $Form.BackColor                  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
@@ -2433,8 +2433,8 @@ $Groupbox8.location              = New-Object System.Drawing.Point(975,93)
 
 # === Groupbox9: TCP / OS Offloads ===
 $Groupbox9                       = New-Object system.Windows.Forms.Groupbox
-$Groupbox9.height                = 300
-$Groupbox9.width                 = 230
+$Groupbox9.height                = 720
+$Groupbox9.width                 = 520
 $Groupbox9.text                  = "TCP / OS Offloads"
 $Groupbox9.location              = New-Object System.Drawing.Point(1365,93)
 $Groupbox9.Font                  = New-Object System.Drawing.Font('Calibri',10)
@@ -2442,16 +2442,536 @@ $Groupbox9.ForeColor             = $ColorPrimary
 
 $lbl_Autotune                    = New-Object system.Windows.Forms.Label
 $lbl_Autotune.AutoSize           = $true
-$lbl_Autotune.location           = New-Object System.Drawing.Point(10,25)
+$lbl_Autotune.location           = New-Object System.Drawing.Point(15,25)
 $lbl_Autotune.Font               = New-Object System.Drawing.Font('Calibri',10)
 $lbl_Autotune.ForeColor          = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
 $lbl_Autotune.Text               = "Auto-Tuning: " + (Get-TcpAutoTuningState)
+
+$lbl_TcpWindowAutoTuning         = New-Object system.Windows.Forms.Label
+$lbl_TcpWindowAutoTuning.AutoSize= $true
+$lbl_TcpWindowAutoTuning.location= New-Object System.Drawing.Point(15,55)
+$lbl_TcpWindowAutoTuning.Font    = New-Object System.Drawing.Font('Calibri',10)
+$lbl_TcpWindowAutoTuning.ForeColor = $ColorPrimary
+$lbl_TcpWindowAutoTuning.Text    = "TCP Window Auto-Tuning:"
+
+$cb_TcpWindowAutoTuning          = New-Object system.Windows.Forms.ComboBox
+$cb_TcpWindowAutoTuning.width    = 170
+$cb_TcpWindowAutoTuning.height   = 24
+@('disabled','normal','restricted','highlyrestricted','experimental') | ForEach-Object {[void]$cb_TcpWindowAutoTuning.Items.Add($_)}
+$cb_TcpWindowAutoTuning.location = New-Object System.Drawing.Point(200,52)
+$cb_TcpWindowAutoTuning.Font     = New-Object System.Drawing.Font('Calibri',10)
+$cb_TcpWindowAutoTuning.ForeColor= $ColorPrimary
+$cb_TcpWindowAutoTuning.BackColor= $ColorSurface
+
+$lbl_WindowsScalingHeuristics    = New-Object system.Windows.Forms.Label
+$lbl_WindowsScalingHeuristics.AutoSize = $true
+$lbl_WindowsScalingHeuristics.location = New-Object System.Drawing.Point(15,85)
+$lbl_WindowsScalingHeuristics.Font = New-Object System.Drawing.Font('Calibri',10)
+$lbl_WindowsScalingHeuristics.ForeColor = $ColorPrimary
+$lbl_WindowsScalingHeuristics.Text = "Windows Scaling heuristics:"
+
+$cb_WindowsScalingHeuristics     = New-Object system.Windows.Forms.ComboBox
+$cb_WindowsScalingHeuristics.width= 170
+$cb_WindowsScalingHeuristics.height= 24
+@('disabled','enabled') | ForEach-Object {[void]$cb_WindowsScalingHeuristics.Items.Add($_)}
+$cb_WindowsScalingHeuristics.location = New-Object System.Drawing.Point(200,82)
+$cb_WindowsScalingHeuristics.Font = New-Object System.Drawing.Font('Calibri',10)
+$cb_WindowsScalingHeuristics.ForeColor = $ColorPrimary
+$cb_WindowsScalingHeuristics.BackColor = $ColorSurface
+
+$lbl_CongestionControlProvider   = New-Object system.Windows.Forms.Label
+$lbl_CongestionControlProvider.AutoSize = $true
+$lbl_CongestionControlProvider.location = New-Object System.Drawing.Point(15,115)
+$lbl_CongestionControlProvider.Font = New-Object System.Drawing.Font('Calibri',10)
+$lbl_CongestionControlProvider.ForeColor = $ColorPrimary
+$lbl_CongestionControlProvider.Text = "Congestion Control Provider:"
+
+$cb_CongestionControlProvider    = New-Object system.Windows.Forms.ComboBox
+$cb_CongestionControlProvider.width = 170
+$cb_CongestionControlProvider.height = 24
+@('ctcp','cubic','newreno','none') | ForEach-Object {[void]$cb_CongestionControlProvider.Items.Add($_)}
+$cb_CongestionControlProvider.location = New-Object System.Drawing.Point(200,112)
+$cb_CongestionControlProvider.Font = New-Object System.Drawing.Font('Calibri',10)
+$cb_CongestionControlProvider.ForeColor = $ColorPrimary
+$cb_CongestionControlProvider.BackColor = $ColorSurface
+
+$lbl_ReceiveSideScaling          = New-Object system.Windows.Forms.Label
+$lbl_ReceiveSideScaling.AutoSize = $true
+$lbl_ReceiveSideScaling.location = New-Object System.Drawing.Point(15,145)
+$lbl_ReceiveSideScaling.Font     = New-Object System.Drawing.Font('Calibri',10)
+$lbl_ReceiveSideScaling.ForeColor= $ColorPrimary
+$lbl_ReceiveSideScaling.Text     = "Receive-Side Scaling (RSS):"
+
+$cb_ReceiveSideScaling           = New-Object system.Windows.Forms.ComboBox
+$cb_ReceiveSideScaling.width     = 170
+$cb_ReceiveSideScaling.height    = 24
+@('disabled','enabled') | ForEach-Object {[void]$cb_ReceiveSideScaling.Items.Add($_)}
+$cb_ReceiveSideScaling.location  = New-Object System.Drawing.Point(200,142)
+$cb_ReceiveSideScaling.Font      = New-Object System.Drawing.Font('Calibri',10)
+$cb_ReceiveSideScaling.ForeColor = $ColorPrimary
+$cb_ReceiveSideScaling.BackColor = $ColorSurface
+
+$lbl_Rsc                         = New-Object system.Windows.Forms.Label
+$lbl_Rsc.AutoSize                = $true
+$lbl_Rsc.location                = New-Object System.Drawing.Point(15,175)
+$lbl_Rsc.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$lbl_Rsc.ForeColor               = $ColorPrimary
+$lbl_Rsc.Text                    = "R.Segment Coalescing (RSC):"
+
+$cb_Rsc                          = New-Object system.Windows.Forms.ComboBox
+$cb_Rsc.width                    = 170
+$cb_Rsc.height                   = 24
+@('disabled','enabled') | ForEach-Object {[void]$cb_Rsc.Items.Add($_)}
+$cb_Rsc.location                 = New-Object System.Drawing.Point(200,172)
+$cb_Rsc.Font                     = New-Object System.Drawing.Font('Calibri',10)
+$cb_Rsc.ForeColor                = $ColorPrimary
+$cb_Rsc.BackColor                = $ColorSurface
+
+$lbl_Ttl                         = New-Object system.Windows.Forms.Label
+$lbl_Ttl.AutoSize                = $true
+$lbl_Ttl.location                = New-Object System.Drawing.Point(270,55)
+$lbl_Ttl.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$lbl_Ttl.ForeColor               = $ColorPrimary
+$lbl_Ttl.Text                    = "Time to Live (TTL):"
+
+$tb_Ttl                          = New-Object system.Windows.Forms.TextBox
+$tb_Ttl.multiline                = $false
+$tb_Ttl.width                    = 90
+$tb_Ttl.height                   = 22
+$tb_Ttl.location                 = New-Object System.Drawing.Point(430,52)
+$tb_Ttl.Font                     = New-Object System.Drawing.Font('Calibri',10)
+$tb_Ttl.ForeColor                = $ColorPrimary
+$tb_Ttl.BackColor                = $ColorSurface
+
+$lbl_EcnCapability               = New-Object system.Windows.Forms.Label
+$lbl_EcnCapability.AutoSize      = $true
+$lbl_EcnCapability.location      = New-Object System.Drawing.Point(270,85)
+$lbl_EcnCapability.Font          = New-Object System.Drawing.Font('Calibri',10)
+$lbl_EcnCapability.ForeColor     = $ColorPrimary
+$lbl_EcnCapability.Text          = "ECN Capability:"
+
+$cb_EcnCapability                = New-Object system.Windows.Forms.ComboBox
+$cb_EcnCapability.width          = 150
+$cb_EcnCapability.height         = 24
+@('disabled','enabled','default') | ForEach-Object {[void]$cb_EcnCapability.Items.Add($_)}
+$cb_EcnCapability.location       = New-Object System.Drawing.Point(430,82)
+$cb_EcnCapability.Font           = New-Object System.Drawing.Font('Calibri',10)
+$cb_EcnCapability.ForeColor      = $ColorPrimary
+$cb_EcnCapability.BackColor      = $ColorSurface
+
+$lbl_ChecksumOffloading          = New-Object system.Windows.Forms.Label
+$lbl_ChecksumOffloading.AutoSize = $true
+$lbl_ChecksumOffloading.location = New-Object System.Drawing.Point(270,115)
+$lbl_ChecksumOffloading.Font     = New-Object System.Drawing.Font('Calibri',10)
+$lbl_ChecksumOffloading.ForeColor= $ColorPrimary
+$lbl_ChecksumOffloading.Text     = "Checksum Offloading:"
+
+$cb_ChecksumOffloading           = New-Object system.Windows.Forms.ComboBox
+$cb_ChecksumOffloading.width     = 150
+$cb_ChecksumOffloading.height    = 24
+@('disabled','enabled') | ForEach-Object {[void]$cb_ChecksumOffloading.Items.Add($_)}
+$cb_ChecksumOffloading.location  = New-Object System.Drawing.Point(430,112)
+$cb_ChecksumOffloading.Font      = New-Object System.Drawing.Font('Calibri',10)
+$cb_ChecksumOffloading.ForeColor = $ColorPrimary
+$cb_ChecksumOffloading.BackColor = $ColorSurface
+
+$lbl_TcpChimney                  = New-Object system.Windows.Forms.Label
+$lbl_TcpChimney.AutoSize         = $true
+$lbl_TcpChimney.location         = New-Object System.Drawing.Point(270,145)
+$lbl_TcpChimney.Font             = New-Object System.Drawing.Font('Calibri',10)
+$lbl_TcpChimney.ForeColor        = $ColorPrimary
+$lbl_TcpChimney.Text             = "TCP Chimney Offload:"
+
+$cb_TcpChimney                   = New-Object system.Windows.Forms.ComboBox
+$cb_TcpChimney.width             = 150
+$cb_TcpChimney.height            = 24
+@('disabled','enabled','default') | ForEach-Object {[void]$cb_TcpChimney.Items.Add($_)}
+$cb_TcpChimney.location          = New-Object System.Drawing.Point(430,142)
+$cb_TcpChimney.Font              = New-Object System.Drawing.Font('Calibri',10)
+$cb_TcpChimney.ForeColor         = $ColorPrimary
+$cb_TcpChimney.BackColor         = $ColorSurface
+
+$lbl_Lso                         = New-Object system.Windows.Forms.Label
+$lbl_Lso.AutoSize                = $true
+$lbl_Lso.location                = New-Object System.Drawing.Point(270,175)
+$lbl_Lso.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$lbl_Lso.ForeColor               = $ColorPrimary
+$lbl_Lso.Text                    = "Large Send Offload (LSO):"
+
+$cb_Lso                          = New-Object system.Windows.Forms.ComboBox
+$cb_Lso.width                    = 150
+$cb_Lso.height                   = 24
+@('disabled','enabled') | ForEach-Object {[void]$cb_Lso.Items.Add($_)}
+$cb_Lso.location                 = New-Object System.Drawing.Point(430,172)
+$cb_Lso.Font                     = New-Object System.Drawing.Font('Calibri',10)
+$cb_Lso.ForeColor                = $ColorPrimary
+$cb_Lso.BackColor                = $ColorSurface
+
+$lbl_Tcp1323Timestamps           = New-Object system.Windows.Forms.Label
+$lbl_Tcp1323Timestamps.AutoSize  = $true
+$lbl_Tcp1323Timestamps.location  = New-Object System.Drawing.Point(270,205)
+$lbl_Tcp1323Timestamps.Font      = New-Object System.Drawing.Font('Calibri',10)
+$lbl_Tcp1323Timestamps.ForeColor = $ColorPrimary
+$lbl_Tcp1323Timestamps.Text      = "TCP 1323 Timestamps:"
+
+$cb_Tcp1323Timestamps            = New-Object system.Windows.Forms.ComboBox
+$cb_Tcp1323Timestamps.width      = 150
+$cb_Tcp1323Timestamps.height     = 24
+@('disabled','enabled') | ForEach-Object {[void]$cb_Tcp1323Timestamps.Items.Add($_)}
+$cb_Tcp1323Timestamps.location   = New-Object System.Drawing.Point(430,202)
+$cb_Tcp1323Timestamps.Font       = New-Object System.Drawing.Font('Calibri',10)
+$cb_Tcp1323Timestamps.ForeColor  = $ColorPrimary
+$cb_Tcp1323Timestamps.BackColor  = $ColorSurface
+
+$lbl_IEOptimization              = New-Object system.Windows.Forms.Label
+$lbl_IEOptimization.AutoSize     = $true
+$lbl_IEOptimization.location     = New-Object System.Drawing.Point(15,215)
+$lbl_IEOptimization.Font         = New-Object System.Drawing.Font('Calibri',10,[System.Drawing.FontStyle]::Bold)
+$lbl_IEOptimization.ForeColor    = $ColorPrimary
+$lbl_IEOptimization.Text         = "Internet Explorer Optimization"
+
+$lbl_MaxConnectionsPer10         = New-Object system.Windows.Forms.Label
+$lbl_MaxConnectionsPer10.AutoSize= $true
+$lbl_MaxConnectionsPer10.location= New-Object System.Drawing.Point(15,240)
+$lbl_MaxConnectionsPer10.Font    = New-Object System.Drawing.Font('Calibri',10)
+$lbl_MaxConnectionsPer10.ForeColor= $ColorPrimary
+$lbl_MaxConnectionsPer10.Text    = "MaxConnectionsPer1_0Server:"
+
+$tb_MaxConnectionsPer10          = New-Object system.Windows.Forms.TextBox
+$tb_MaxConnectionsPer10.multiline= $false
+$tb_MaxConnectionsPer10.width    = 80
+$tb_MaxConnectionsPer10.height   = 22
+$tb_MaxConnectionsPer10.location = New-Object System.Drawing.Point(200,237)
+$tb_MaxConnectionsPer10.Font     = New-Object System.Drawing.Font('Calibri',10)
+$tb_MaxConnectionsPer10.ForeColor= $ColorPrimary
+$tb_MaxConnectionsPer10.BackColor= $ColorSurface
+
+$lbl_MaxConnectionsPerServer     = New-Object system.Windows.Forms.Label
+$lbl_MaxConnectionsPerServer.AutoSize = $true
+$lbl_MaxConnectionsPerServer.location = New-Object System.Drawing.Point(15,270)
+$lbl_MaxConnectionsPerServer.Font = New-Object System.Drawing.Font('Calibri',10)
+$lbl_MaxConnectionsPerServer.ForeColor = $ColorPrimary
+$lbl_MaxConnectionsPerServer.Text = "MaxConnectionsPerServer:"
+
+$tb_MaxConnectionsPerServer      = New-Object system.Windows.Forms.TextBox
+$tb_MaxConnectionsPerServer.multiline = $false
+$tb_MaxConnectionsPerServer.width = 80
+$tb_MaxConnectionsPerServer.height = 22
+$tb_MaxConnectionsPerServer.location = New-Object System.Drawing.Point(200,267)
+$tb_MaxConnectionsPerServer.Font  = New-Object System.Drawing.Font('Calibri',10)
+$tb_MaxConnectionsPerServer.ForeColor = $ColorPrimary
+$tb_MaxConnectionsPerServer.BackColor = $ColorSurface
+
+$lbl_HostResolutionPriority      = New-Object system.Windows.Forms.Label
+$lbl_HostResolutionPriority.AutoSize = $true
+$lbl_HostResolutionPriority.location = New-Object System.Drawing.Point(15,300)
+$lbl_HostResolutionPriority.Font  = New-Object System.Drawing.Font('Calibri',10,[System.Drawing.FontStyle]::Bold)
+$lbl_HostResolutionPriority.ForeColor = $ColorPrimary
+$lbl_HostResolutionPriority.Text  = "Host Resolution Priority"
+
+$lbl_LocalPriority               = New-Object system.Windows.Forms.Label
+$lbl_LocalPriority.AutoSize      = $true
+$lbl_LocalPriority.location      = New-Object System.Drawing.Point(15,325)
+$lbl_LocalPriority.Font          = New-Object System.Drawing.Font('Calibri',10)
+$lbl_LocalPriority.ForeColor     = $ColorPrimary
+$lbl_LocalPriority.Text          = "LocalPriority:"
+
+$tb_LocalPriority                = New-Object system.Windows.Forms.TextBox
+$tb_LocalPriority.multiline      = $false
+$tb_LocalPriority.width          = 80
+$tb_LocalPriority.height         = 22
+$tb_LocalPriority.location       = New-Object System.Drawing.Point(200,322)
+$tb_LocalPriority.Font           = New-Object System.Drawing.Font('Calibri',10)
+$tb_LocalPriority.ForeColor      = $ColorPrimary
+$tb_LocalPriority.BackColor      = $ColorSurface
+
+$lbl_HostPriority                = New-Object system.Windows.Forms.Label
+$lbl_HostPriority.AutoSize       = $true
+$lbl_HostPriority.location       = New-Object System.Drawing.Point(15,355)
+$lbl_HostPriority.Font           = New-Object System.Drawing.Font('Calibri',10)
+$lbl_HostPriority.ForeColor      = $ColorPrimary
+$lbl_HostPriority.Text           = "HostPriority:"
+
+$tb_HostPriority                 = New-Object system.Windows.Forms.TextBox
+$tb_HostPriority.multiline       = $false
+$tb_HostPriority.width           = 80
+$tb_HostPriority.height          = 22
+$tb_HostPriority.location        = New-Object System.Drawing.Point(200,352)
+$tb_HostPriority.Font            = New-Object System.Drawing.Font('Calibri',10)
+$tb_HostPriority.ForeColor       = $ColorPrimary
+$tb_HostPriority.BackColor       = $ColorSurface
+
+$lbl_DnsPriority                 = New-Object system.Windows.Forms.Label
+$lbl_DnsPriority.AutoSize        = $true
+$lbl_DnsPriority.location        = New-Object System.Drawing.Point(15,385)
+$lbl_DnsPriority.Font            = New-Object System.Drawing.Font('Calibri',10)
+$lbl_DnsPriority.ForeColor       = $ColorPrimary
+$lbl_DnsPriority.Text            = "DnsPriority:"
+
+$tb_DnsPriority                  = New-Object system.Windows.Forms.TextBox
+$tb_DnsPriority.multiline        = $false
+$tb_DnsPriority.width            = 80
+$tb_DnsPriority.height           = 22
+$tb_DnsPriority.location         = New-Object System.Drawing.Point(200,382)
+$tb_DnsPriority.Font             = New-Object System.Drawing.Font('Calibri',10)
+$tb_DnsPriority.ForeColor        = $ColorPrimary
+$tb_DnsPriority.BackColor        = $ColorSurface
+
+$lbl_NetbtPriority               = New-Object system.Windows.Forms.Label
+$lbl_NetbtPriority.AutoSize      = $true
+$lbl_NetbtPriority.location      = New-Object System.Drawing.Point(15,415)
+$lbl_NetbtPriority.Font          = New-Object System.Drawing.Font('Calibri',10)
+$lbl_NetbtPriority.ForeColor     = $ColorPrimary
+$lbl_NetbtPriority.Text          = "NetbtPriority:"
+
+$tb_NetbtPriority                = New-Object system.Windows.Forms.TextBox
+$tb_NetbtPriority.multiline      = $false
+$tb_NetbtPriority.width          = 80
+$tb_NetbtPriority.height         = 22
+$tb_NetbtPriority.location       = New-Object System.Drawing.Point(200,412)
+$tb_NetbtPriority.Font           = New-Object System.Drawing.Font('Calibri',10)
+$tb_NetbtPriority.ForeColor      = $ColorPrimary
+$tb_NetbtPriority.BackColor      = $ColorSurface
+
+$lbl_MaxSynRetransmissions       = New-Object system.Windows.Forms.Label
+$lbl_MaxSynRetransmissions.AutoSize = $true
+$lbl_MaxSynRetransmissions.location = New-Object System.Drawing.Point(15,445)
+$lbl_MaxSynRetransmissions.Font  = New-Object System.Drawing.Font('Calibri',10)
+$lbl_MaxSynRetransmissions.ForeColor = $ColorPrimary
+$lbl_MaxSynRetransmissions.Text  = "Max SYN Retransmissions:"
+
+$tb_MaxSynRetransmissions        = New-Object system.Windows.Forms.TextBox
+$tb_MaxSynRetransmissions.multiline = $false
+$tb_MaxSynRetransmissions.width  = 80
+$tb_MaxSynRetransmissions.height = 22
+$tb_MaxSynRetransmissions.location = New-Object System.Drawing.Point(200,442)
+$tb_MaxSynRetransmissions.Font   = New-Object System.Drawing.Font('Calibri',10)
+$tb_MaxSynRetransmissions.ForeColor = $ColorPrimary
+$tb_MaxSynRetransmissions.BackColor = $ColorSurface
+
+$lbl_NonSackRttResiliency        = New-Object system.Windows.Forms.Label
+$lbl_NonSackRttResiliency.AutoSize = $true
+$lbl_NonSackRttResiliency.location = New-Object System.Drawing.Point(15,475)
+$lbl_NonSackRttResiliency.Font   = New-Object System.Drawing.Font('Calibri',10)
+$lbl_NonSackRttResiliency.ForeColor = $ColorPrimary
+$lbl_NonSackRttResiliency.Text   = "NonSackRttResiliency:"
+
+$cb_NonSackRttResiliency         = New-Object system.Windows.Forms.ComboBox
+$cb_NonSackRttResiliency.width   = 120
+$cb_NonSackRttResiliency.height  = 24
+@('disabled','enabled') | ForEach-Object {[void]$cb_NonSackRttResiliency.Items.Add($_)}
+$cb_NonSackRttResiliency.location = New-Object System.Drawing.Point(200,472)
+$cb_NonSackRttResiliency.Font    = New-Object System.Drawing.Font('Calibri',10)
+$cb_NonSackRttResiliency.ForeColor = $ColorPrimary
+$cb_NonSackRttResiliency.BackColor = $ColorSurface
+
+$lbl_RtoHeader                   = New-Object system.Windows.Forms.Label
+$lbl_RtoHeader.AutoSize          = $true
+$lbl_RtoHeader.location          = New-Object System.Drawing.Point(15,505)
+$lbl_RtoHeader.Font              = New-Object System.Drawing.Font('Calibri',10,[System.Drawing.FontStyle]::Bold)
+$lbl_RtoHeader.ForeColor         = $ColorPrimary
+$lbl_RtoHeader.Text              = "Retransmit Timeout (RTO)"
+
+$lbl_InitialRto                  = New-Object system.Windows.Forms.Label
+$lbl_InitialRto.AutoSize         = $true
+$lbl_InitialRto.location         = New-Object System.Drawing.Point(15,530)
+$lbl_InitialRto.Font             = New-Object System.Drawing.Font('Calibri',10)
+$lbl_InitialRto.ForeColor        = $ColorPrimary
+$lbl_InitialRto.Text             = "Initial RTO:"
+
+$tb_InitialRto                   = New-Object system.Windows.Forms.TextBox
+$tb_InitialRto.multiline         = $false
+$tb_InitialRto.width             = 80
+$tb_InitialRto.height            = 22
+$tb_InitialRto.location          = New-Object System.Drawing.Point(200,527)
+$tb_InitialRto.Font              = New-Object System.Drawing.Font('Calibri',10)
+$tb_InitialRto.ForeColor         = $ColorPrimary
+$tb_InitialRto.BackColor         = $ColorSurface
+
+$lbl_MinRto                      = New-Object system.Windows.Forms.Label
+$lbl_MinRto.AutoSize             = $true
+$lbl_MinRto.location             = New-Object System.Drawing.Point(15,560)
+$lbl_MinRto.Font                 = New-Object System.Drawing.Font('Calibri',10)
+$lbl_MinRto.ForeColor            = $ColorPrimary
+$lbl_MinRto.Text                 = "Min RTO:"
+
+$tb_MinRto                       = New-Object system.Windows.Forms.TextBox
+$tb_MinRto.multiline             = $false
+$tb_MinRto.width                 = 80
+$tb_MinRto.height                = 22
+$tb_MinRto.location              = New-Object System.Drawing.Point(200,557)
+$tb_MinRto.Font                  = New-Object System.Drawing.Font('Calibri',10)
+$tb_MinRto.ForeColor             = $ColorPrimary
+$tb_MinRto.BackColor             = $ColorSurface
+
+$lbl_TypeQualityService          = New-Object system.Windows.Forms.Label
+$lbl_TypeQualityService.AutoSize = $true
+$lbl_TypeQualityService.location = New-Object System.Drawing.Point(270,235)
+$lbl_TypeQualityService.Font     = New-Object System.Drawing.Font('Calibri',10,[System.Drawing.FontStyle]::Bold)
+$lbl_TypeQualityService.ForeColor = $ColorPrimary
+$lbl_TypeQualityService.Text     = "Type/Quality of Service"
+
+$lbl_QosNonBestEffort            = New-Object system.Windows.Forms.Label
+$lbl_QosNonBestEffort.AutoSize   = $true
+$lbl_QosNonBestEffort.location   = New-Object System.Drawing.Point(270,260)
+$lbl_QosNonBestEffort.Font       = New-Object System.Drawing.Font('Calibri',10)
+$lbl_QosNonBestEffort.ForeColor  = $ColorPrimary
+$lbl_QosNonBestEffort.Text       = "QoS: NonBestEffortLimit:"
+
+$tb_QosNonBestEffort             = New-Object system.Windows.Forms.TextBox
+$tb_QosNonBestEffort.multiline   = $false
+$tb_QosNonBestEffort.width       = 100
+$tb_QosNonBestEffort.height      = 22
+$tb_QosNonBestEffort.location    = New-Object System.Drawing.Point(430,257)
+$tb_QosNonBestEffort.Font        = New-Object System.Drawing.Font('Calibri',10)
+$tb_QosNonBestEffort.ForeColor   = $ColorPrimary
+$tb_QosNonBestEffort.BackColor   = $ColorSurface
+
+$lbl_QosNla                      = New-Object system.Windows.Forms.Label
+$lbl_QosNla.AutoSize             = $true
+$lbl_QosNla.location             = New-Object System.Drawing.Point(270,290)
+$lbl_QosNla.Font                 = New-Object System.Drawing.Font('Calibri',10)
+$lbl_QosNla.ForeColor            = $ColorPrimary
+$lbl_QosNla.Text                 = "QoS: Do not use NLA:"
+
+$cb_QosNla                       = New-Object system.Windows.Forms.ComboBox
+$cb_QosNla.width                 = 150
+$cb_QosNla.height                = 24
+@('disabled','enabled') | ForEach-Object {[void]$cb_QosNla.Items.Add($_)}
+$cb_QosNla.location              = New-Object System.Drawing.Point(430,287)
+$cb_QosNla.Font                  = New-Object System.Drawing.Font('Calibri',10)
+$cb_QosNla.ForeColor             = $ColorPrimary
+$cb_QosNla.BackColor             = $ColorSurface
+
+$lbl_NetworkThrottleHeader       = New-Object system.Windows.Forms.Label
+$lbl_NetworkThrottleHeader.AutoSize = $true
+$lbl_NetworkThrottleHeader.location = New-Object System.Drawing.Point(270,320)
+$lbl_NetworkThrottleHeader.Font  = New-Object System.Drawing.Font('Calibri',10,[System.Drawing.FontStyle]::Bold)
+$lbl_NetworkThrottleHeader.ForeColor = $ColorPrimary
+$lbl_NetworkThrottleHeader.Text  = "Gaming Tweak - Network Throttling"
+
+$lbl_NetworkThrottlingIndex      = New-Object system.Windows.Forms.Label
+$lbl_NetworkThrottlingIndex.AutoSize = $true
+$lbl_NetworkThrottlingIndex.location = New-Object System.Drawing.Point(270,345)
+$lbl_NetworkThrottlingIndex.Font = New-Object System.Drawing.Font('Calibri',10)
+$lbl_NetworkThrottlingIndex.ForeColor = $ColorPrimary
+$lbl_NetworkThrottlingIndex.Text = "NetworkThrottlingIndex:"
+
+$tb_NetworkThrottlingIndex       = New-Object system.Windows.Forms.TextBox
+$tb_NetworkThrottlingIndex.multiline = $false
+$tb_NetworkThrottlingIndex.width = 120
+$tb_NetworkThrottlingIndex.height = 22
+$tb_NetworkThrottlingIndex.location = New-Object System.Drawing.Point(430,342)
+$tb_NetworkThrottlingIndex.Font  = New-Object System.Drawing.Font('Calibri',10)
+$tb_NetworkThrottlingIndex.ForeColor = $ColorPrimary
+$tb_NetworkThrottlingIndex.BackColor = $ColorSurface
+
+$lbl_DisableNagleHeader          = New-Object system.Windows.Forms.Label
+$lbl_DisableNagleHeader.AutoSize = $true
+$lbl_DisableNagleHeader.location = New-Object System.Drawing.Point(270,375)
+$lbl_DisableNagleHeader.Font     = New-Object System.Drawing.Font('Calibri',10,[System.Drawing.FontStyle]::Bold)
+$lbl_DisableNagleHeader.ForeColor = $ColorPrimary
+$lbl_DisableNagleHeader.Text     = "Gaming Tweak - Disable Nagle's algorithm"
+
+$lbl_TcpAckFrequency             = New-Object system.Windows.Forms.Label
+$lbl_TcpAckFrequency.AutoSize    = $true
+$lbl_TcpAckFrequency.location    = New-Object System.Drawing.Point(270,400)
+$lbl_TcpAckFrequency.Font        = New-Object System.Drawing.Font('Calibri',10)
+$lbl_TcpAckFrequency.ForeColor   = $ColorPrimary
+$lbl_TcpAckFrequency.Text        = "TCPAckFrequency:"
+
+$tb_TcpAckFrequency              = New-Object system.Windows.Forms.TextBox
+$tb_TcpAckFrequency.multiline    = $false
+$tb_TcpAckFrequency.width        = 120
+$tb_TcpAckFrequency.height       = 22
+$tb_TcpAckFrequency.location     = New-Object System.Drawing.Point(430,397)
+$tb_TcpAckFrequency.Font         = New-Object System.Drawing.Font('Calibri',10)
+$tb_TcpAckFrequency.ForeColor    = $ColorPrimary
+$tb_TcpAckFrequency.BackColor    = $ColorSurface
+
+$lbl_TcpNoDelay                  = New-Object system.Windows.Forms.Label
+$lbl_TcpNoDelay.AutoSize         = $true
+$lbl_TcpNoDelay.location         = New-Object System.Drawing.Point(270,430)
+$lbl_TcpNoDelay.Font             = New-Object System.Drawing.Font('Calibri',10)
+$lbl_TcpNoDelay.ForeColor        = $ColorPrimary
+$lbl_TcpNoDelay.Text             = "TCPNoDelay:"
+
+$tb_TcpNoDelay                   = New-Object system.Windows.Forms.TextBox
+$tb_TcpNoDelay.multiline         = $false
+$tb_TcpNoDelay.width             = 120
+$tb_TcpNoDelay.height            = 22
+$tb_TcpNoDelay.location          = New-Object System.Drawing.Point(430,427)
+$tb_TcpNoDelay.Font              = New-Object System.Drawing.Font('Calibri',10)
+$tb_TcpNoDelay.ForeColor         = $ColorPrimary
+$tb_TcpNoDelay.BackColor         = $ColorSurface
+
+$lbl_NetworkMemoryAllocation     = New-Object system.Windows.Forms.Label
+$lbl_NetworkMemoryAllocation.AutoSize = $true
+$lbl_NetworkMemoryAllocation.location = New-Object System.Drawing.Point(270,460)
+$lbl_NetworkMemoryAllocation.Font = New-Object System.Drawing.Font('Calibri',10,[System.Drawing.FontStyle]::Bold)
+$lbl_NetworkMemoryAllocation.ForeColor = $ColorPrimary
+$lbl_NetworkMemoryAllocation.Text = "Network Memory Allocation"
+
+$lbl_LargeSystemCache            = New-Object system.Windows.Forms.Label
+$lbl_LargeSystemCache.AutoSize   = $true
+$lbl_LargeSystemCache.location   = New-Object System.Drawing.Point(270,485)
+$lbl_LargeSystemCache.Font       = New-Object System.Drawing.Font('Calibri',10)
+$lbl_LargeSystemCache.ForeColor  = $ColorPrimary
+$lbl_LargeSystemCache.Text       = "LargeSystemCache:"
+
+$cb_LargeSystemCache             = New-Object system.Windows.Forms.ComboBox
+$cb_LargeSystemCache.width       = 120
+$cb_LargeSystemCache.height      = 24
+@('0','1') | ForEach-Object {[void]$cb_LargeSystemCache.Items.Add($_)}
+$cb_LargeSystemCache.location    = New-Object System.Drawing.Point(430,482)
+$cb_LargeSystemCache.Font        = New-Object System.Drawing.Font('Calibri',10)
+$cb_LargeSystemCache.ForeColor   = $ColorPrimary
+$cb_LargeSystemCache.BackColor   = $ColorSurface
+
+$lbl_DynamicPortAllocation       = New-Object system.Windows.Forms.Label
+$lbl_DynamicPortAllocation.AutoSize = $true
+$lbl_DynamicPortAllocation.location = New-Object System.Drawing.Point(270,515)
+$lbl_DynamicPortAllocation.Font  = New-Object System.Drawing.Font('Calibri',10,[System.Drawing.FontStyle]::Bold)
+$lbl_DynamicPortAllocation.ForeColor = $ColorPrimary
+$lbl_DynamicPortAllocation.Text  = "Dynamic Port Allocation"
+
+$lbl_MaxUserPort                 = New-Object system.Windows.Forms.Label
+$lbl_MaxUserPort.AutoSize        = $true
+$lbl_MaxUserPort.location        = New-Object System.Drawing.Point(270,540)
+$lbl_MaxUserPort.Font            = New-Object System.Drawing.Font('Calibri',10)
+$lbl_MaxUserPort.ForeColor       = $ColorPrimary
+$lbl_MaxUserPort.Text            = "MaxUserPort:"
+
+$tb_MaxUserPort                  = New-Object system.Windows.Forms.TextBox
+$tb_MaxUserPort.multiline        = $false
+$tb_MaxUserPort.width            = 120
+$tb_MaxUserPort.height           = 22
+$tb_MaxUserPort.location         = New-Object System.Drawing.Point(430,537)
+$tb_MaxUserPort.Font             = New-Object System.Drawing.Font('Calibri',10)
+$tb_MaxUserPort.ForeColor        = $ColorPrimary
+$tb_MaxUserPort.BackColor        = $ColorSurface
+
+$lbl_TcpTimedWaitDelay           = New-Object system.Windows.Forms.Label
+$lbl_TcpTimedWaitDelay.AutoSize  = $true
+$lbl_TcpTimedWaitDelay.location  = New-Object System.Drawing.Point(270,570)
+$lbl_TcpTimedWaitDelay.Font      = New-Object System.Drawing.Font('Calibri',10)
+$lbl_TcpTimedWaitDelay.ForeColor = $ColorPrimary
+$lbl_TcpTimedWaitDelay.Text      = "TcpTimedWaitDelay:"
+
+$tb_TcpTimedWaitDelay            = New-Object system.Windows.Forms.TextBox
+$tb_TcpTimedWaitDelay.multiline  = $false
+$tb_TcpTimedWaitDelay.width      = 120
+$tb_TcpTimedWaitDelay.height     = 22
+$tb_TcpTimedWaitDelay.location   = New-Object System.Drawing.Point(430,567)
+$tb_TcpTimedWaitDelay.Font       = New-Object System.Drawing.Font('Calibri',10)
+$tb_TcpTimedWaitDelay.ForeColor  = $ColorPrimary
+$tb_TcpTimedWaitDelay.BackColor  = $ColorSurface
 
 $btn_TcpSafe                     = New-Object system.Windows.Forms.Button
 $btn_TcpSafe.text                = "Preset: SAFE"
 $btn_TcpSafe.width               = 200
 $btn_TcpSafe.height              = 28
-$btn_TcpSafe.location            = New-Object System.Drawing.Point(15,60)
+$btn_TcpSafe.location            = New-Object System.Drawing.Point(15,600)
 $btn_TcpSafe.Font                = New-Object System.Drawing.Font('Calibri',10)
 $btn_TcpSafe.ForeColor           = $ColorActionText
 $btn_TcpSafe.BackColor           = $ColorQuickPreset
@@ -2460,7 +2980,7 @@ $btn_TcpBalanced                 = New-Object system.Windows.Forms.Button
 $btn_TcpBalanced.text            = "Preset: BALANCED"
 $btn_TcpBalanced.width           = 200
 $btn_TcpBalanced.height          = 28
-$btn_TcpBalanced.location        = New-Object System.Drawing.Point(15,100)
+$btn_TcpBalanced.location        = New-Object System.Drawing.Point(270,600)
 $btn_TcpBalanced.Font            = New-Object System.Drawing.Font('Calibri',10)
 $btn_TcpBalanced.ForeColor       = $ColorActionText
 $btn_TcpBalanced.BackColor       = $ColorQuickPreset
@@ -2469,7 +2989,7 @@ $btn_TcpAggressive               = New-Object system.Windows.Forms.Button
 $btn_TcpAggressive.text          = "Preset: AGGRESSIVE"
 $btn_TcpAggressive.width         = 200
 $btn_TcpAggressive.height        = 28
-$btn_TcpAggressive.location      = New-Object System.Drawing.Point(15,140)
+$btn_TcpAggressive.location      = New-Object System.Drawing.Point(15,635)
 $btn_TcpAggressive.Font          = New-Object System.Drawing.Font('Calibri',10)
 $btn_TcpAggressive.ForeColor     = $ColorActionText
 $btn_TcpAggressive.BackColor     = $ColorQuickPreset
@@ -2478,7 +2998,7 @@ $btn_ToggleAutotune              = New-Object system.Windows.Forms.Button
 $btn_ToggleAutotune.text         = "Toggle Auto-Tuning"
 $btn_ToggleAutotune.width        = 200
 $btn_ToggleAutotune.height       = 28
-$btn_ToggleAutotune.location     = New-Object System.Drawing.Point(15,190)
+$btn_ToggleAutotune.location     = New-Object System.Drawing.Point(270,635)
 $btn_ToggleAutotune.Font         = New-Object System.Drawing.Font('Calibri',10)
 $btn_ToggleAutotune.ForeColor    = $ColorActionText
 $btn_ToggleAutotune.BackColor    = $ColorQuickAction
@@ -2487,7 +3007,7 @@ $btn_IrqAffinityDialog               = New-Object system.Windows.Forms.Button
 $btn_IrqAffinityDialog.text          = "IRQ & Affinity"
 $btn_IrqAffinityDialog.width         = 200
 $btn_IrqAffinityDialog.height        = 28
-$btn_IrqAffinityDialog.location      = New-Object System.Drawing.Point(15,230)
+$btn_IrqAffinityDialog.location      = New-Object System.Drawing.Point(15,670)
 $btn_IrqAffinityDialog.Font          = New-Object System.Drawing.Font('Calibri',10,[System.Drawing.FontStyle]::Bold)
 $btn_IrqAffinityDialog.ForeColor     = $ColorActionText
 $btn_IrqAffinityDialog.BackColor     = $ColorQuickAction
@@ -2496,26 +3016,17 @@ $btn_NicExtrasDialog               = New-Object system.Windows.Forms.Button
 $btn_NicExtrasDialog.text          = "NIC Extras"
 $btn_NicExtrasDialog.width         = 200
 $btn_NicExtrasDialog.height        = 28
-$btn_NicExtrasDialog.location      = New-Object System.Drawing.Point(15,265)
+$btn_NicExtrasDialog.location      = New-Object System.Drawing.Point(270,670)
 $btn_NicExtrasDialog.Font          = New-Object System.Drawing.Font('Calibri',10,[System.Drawing.FontStyle]::Bold)
 $btn_NicExtrasDialog.ForeColor     = $ColorActionText
 $btn_NicExtrasDialog.BackColor     = $ColorQuickAction
-
-$btn_IrqAffinityDialog              = New-Object system.Windows.Forms.Button
-$btn_IrqAffinityDialog.text         = "IRQ & Affinity3333"
-$btn_IrqAffinityDialog.width        = 200
-$btn_IrqAffinityDialog.height       = 28
-$btn_IrqAffinityDialog.location     = New-Object System.Drawing.Point(15,230)
-$btn_IrqAffinityDialog.Font         = New-Object System.Drawing.Font('Calibri',10)
-$btn_IrqAffinityDialog.ForeColor    = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
-$btn_IrqAffinityDialog.BackColor    = [System.Drawing.ColorTranslator]::FromHtml("#171717")
 
 # === Groupbox10: QoS ===
 $Groupbox10                       = New-Object system.Windows.Forms.Groupbox
 $Groupbox10.height                = 380
 $Groupbox10.width                 = 230
 $Groupbox10.text                  = "QoS"
-$Groupbox10.location              = New-Object System.Drawing.Point(1365,405)
+$Groupbox10.location              = New-Object System.Drawing.Point(1365,830)
 $Groupbox10.Font                  = New-Object System.Drawing.Font('Calibri',10)
 $Groupbox10.ForeColor             = $ColorPrimary
 
@@ -2600,7 +3111,7 @@ $Groupbox11                       = New-Object system.Windows.Forms.Groupbox
 $Groupbox11.height                = 200
 $Groupbox11.width                 = 260
 $Groupbox11.text                  = "NDIS & MMCSS"
-$Groupbox11.location              = New-Object System.Drawing.Point(1365,790)
+$Groupbox11.location              = New-Object System.Drawing.Point(1365,1225)
 $Groupbox11.Font                  = New-Object System.Drawing.Font('Calibri',10)
 $Groupbox11.ForeColor             = $ColorPrimary
 
@@ -3166,7 +3677,39 @@ $cb_CoalesceBufferSize.Font      = New-Object System.Drawing.Font('Calibri',9)
 $cb_CoalesceBufferSize.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
 $cb_CoalesceBufferSize.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
 
-$Groupbox9.controls.AddRange(@($lbl_Autotune,$btn_TcpSafe,$btn_TcpBalanced,$btn_TcpAggressive,$btn_ToggleAutotune,$btn_IrqAffinityDialog,$btn_NicExtrasDialog))
+$Groupbox9.controls.AddRange(@(
+    $lbl_Autotune,
+    $lbl_TcpWindowAutoTuning,$cb_TcpWindowAutoTuning,
+    $lbl_WindowsScalingHeuristics,$cb_WindowsScalingHeuristics,
+    $lbl_CongestionControlProvider,$cb_CongestionControlProvider,
+    $lbl_ReceiveSideScaling,$cb_ReceiveSideScaling,
+    $lbl_Rsc,$cb_Rsc,
+    $lbl_Ttl,$tb_Ttl,
+    $lbl_EcnCapability,$cb_EcnCapability,
+    $lbl_ChecksumOffloading,$cb_ChecksumOffloading,
+    $lbl_TcpChimney,$cb_TcpChimney,
+    $lbl_Lso,$cb_Lso,
+    $lbl_Tcp1323Timestamps,$cb_Tcp1323Timestamps,
+    $lbl_IEOptimization,
+    $lbl_MaxConnectionsPer10,$tb_MaxConnectionsPer10,
+    $lbl_MaxConnectionsPerServer,$tb_MaxConnectionsPerServer,
+    $lbl_HostResolutionPriority,
+    $lbl_LocalPriority,$tb_LocalPriority,
+    $lbl_HostPriority,$tb_HostPriority,
+    $lbl_DnsPriority,$tb_DnsPriority,
+    $lbl_NetbtPriority,$tb_NetbtPriority,
+    $lbl_MaxSynRetransmissions,$tb_MaxSynRetransmissions,
+    $lbl_NonSackRttResiliency,$cb_NonSackRttResiliency,
+    $lbl_RtoHeader,$lbl_InitialRto,$tb_InitialRto,$lbl_MinRto,$tb_MinRto,
+    $lbl_TypeQualityService,
+    $lbl_QosNonBestEffort,$tb_QosNonBestEffort,
+    $lbl_QosNla,$cb_QosNla,
+    $lbl_NetworkThrottleHeader,$lbl_NetworkThrottlingIndex,$tb_NetworkThrottlingIndex,
+    $lbl_DisableNagleHeader,$lbl_TcpAckFrequency,$tb_TcpAckFrequency,$lbl_TcpNoDelay,$tb_TcpNoDelay,
+    $lbl_NetworkMemoryAllocation,$lbl_LargeSystemCache,$cb_LargeSystemCache,
+    $lbl_DynamicPortAllocation,$lbl_MaxUserPort,$tb_MaxUserPort,$lbl_TcpTimedWaitDelay,$tb_TcpTimedWaitDelay,
+    $btn_TcpSafe,$btn_TcpBalanced,$btn_TcpAggressive,$btn_ToggleAutotune,$btn_IrqAffinityDialog,$btn_NicExtrasDialog
+))
 $Groupbox10.controls.AddRange(@($lbl_QoS_Presets,$cb_QoS_Preset,$btn_QoS_BF6,$btn_QoS_Multi,$btn_QoS_Custom,$btn_QoS_Remove,$btn_Security,$lbl_QoS_List,$lst_QoS))
 $Groupbox11.controls.AddRange(@($lbl_Mmcss,$btn_AckTweaks,$btn_MmcssApply,$btn_MmcssRevert))
 
