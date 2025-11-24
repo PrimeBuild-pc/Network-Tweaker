@@ -420,7 +420,7 @@ function Get-SecurityStatusText {
 function Get-QoSPoliciesNames {
     Ensure-NetQosModule
     try {
-        return (Get-NetQosPolicy -PolicyStore ActiveStore | Select-Object -ExpandProperty Name)
+        return (Get-NetQosPolicy | Select-Object -ExpandProperty Name)
     } catch { return @() }
 }
 
@@ -436,15 +436,13 @@ function New-QoS-AppPair {
     param(
         [Parameter(Mandatory=$true)][string]$NameBase,
         [Parameter(Mandatory=$true)][string]$Exe,
+        [ValidateSet('UDP','TCP')][string]$Protocol = 'UDP',
         [int]$Prio = 5,
         [int]$DSCP = 46
     )
     Ensure-NetQosModule
     try {
-        New-NetQosPolicy -Name $NameBase -AppPathNameMatchCondition $Exe -IPProtocolMatchCondition UDP -PriorityValue8021Action $Prio -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
-    } catch {}
-    try {
-        New-NetQosPolicy -Name ($NameBase + '-DSCP') -AppPathNameMatchCondition $Exe -IPProtocolMatchCondition UDP -DSCPAction $DSCP -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
+        New-NetQosPolicy -Name $NameBase -AppPathNameMatchCondition $Exe -IPProtocolMatchCondition $Protocol -PriorityValue8021Action $Prio -DSCPAction $DSCP -NetworkProfile All -Precedence 127 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
     } catch {}
 }
 
@@ -464,7 +462,7 @@ function Apply-QoS-Preset {
     if ([string]::IsNullOrWhiteSpace($PresetName)) { return }
     $preset = $Global:QoSGamePresets | Where-Object { $_.Display -eq $PresetName } | Select-Object -First 1
     if (-not $preset) { return }
-    New-QoS-AppPair -NameBase $preset.Name -Exe $preset.Exe -Prio 5 -DSCP 46
+    New-QoS-AppPair -NameBase $preset.Name -Exe $preset.Exe -Protocol 'UDP' -Prio 5 -DSCP 46
 }
 
 function Apply-QoS-BF6 {
@@ -473,14 +471,14 @@ function Apply-QoS-BF6 {
 
 function Apply-QoS-MultiApp {
     foreach ($a in $Global:QoSGamePresets) {
-        New-QoS-AppPair -NameBase $a.Name -Exe $a.Exe -Prio 5 -DSCP 46
+        New-QoS-AppPair -NameBase $a.Name -Exe $a.Exe -Protocol 'UDP' -Prio 5 -DSCP 46
     }
 }
 
 function Apply-QoS-Custom {
-    param([string]$PolicyName, [string]$ExeName)
+    param([string]$PolicyName, [string]$ExeName,[ValidateSet('UDP','TCP')][string]$Protocol = 'UDP',[int]$Priority = 5,[int]$DSCP = 46)
     if ([string]::IsNullOrWhiteSpace($PolicyName) -or [string]::IsNullOrWhiteSpace($ExeName)) { return }
-    New-QoS-AppPair -NameBase $PolicyName -Exe $ExeName -Prio 5 -DSCP 46
+    New-QoS-AppPair -NameBase $PolicyName -Exe $ExeName -Protocol $Protocol -Prio $Priority -DSCP $DSCP
 }
 
 function Remove-QoS-All {
@@ -2344,22 +2342,22 @@ $btn_ToggleAutotune.ForeColor    = $ColorActionText
 $btn_ToggleAutotune.BackColor    = $ColorQuickAction
 
 $btn_IrqAffinityDialog               = New-Object system.Windows.Forms.Button
-$btn_IrqAffinityDialog.text          = "IRQ & Affinity..."
+$btn_IrqAffinityDialog.text          = "IRQ & Affinity"
 $btn_IrqAffinityDialog.width         = 200
 $btn_IrqAffinityDialog.height        = 28
 $btn_IrqAffinityDialog.location      = New-Object System.Drawing.Point(15,230)
-$btn_IrqAffinityDialog.Font          = New-Object System.Drawing.Font('Calibri',10)
-$btn_IrqAffinityDialog.ForeColor     = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
-$btn_IrqAffinityDialog.BackColor     = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+$btn_IrqAffinityDialog.Font          = New-Object System.Drawing.Font('Calibri',10,[System.Drawing.FontStyle]::Bold)
+$btn_IrqAffinityDialog.ForeColor     = $ColorActionText
+$btn_IrqAffinityDialog.BackColor     = $ColorQuickAction
 
 $btn_NicExtrasDialog               = New-Object system.Windows.Forms.Button
-$btn_NicExtrasDialog.text          = "NIC Extras..."
+$btn_NicExtrasDialog.text          = "NIC Extras"
 $btn_NicExtrasDialog.width         = 200
 $btn_NicExtrasDialog.height        = 28
 $btn_NicExtrasDialog.location      = New-Object System.Drawing.Point(15,265)
-$btn_NicExtrasDialog.Font          = New-Object System.Drawing.Font('Calibri',10)
-$btn_NicExtrasDialog.ForeColor     = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
-$btn_NicExtrasDialog.BackColor     = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+$btn_NicExtrasDialog.Font          = New-Object System.Drawing.Font('Calibri',10,[System.Drawing.FontStyle]::Bold)
+$btn_NicExtrasDialog.ForeColor     = $ColorActionText
+$btn_NicExtrasDialog.BackColor     = $ColorQuickAction
 
 $btn_IrqAffinityDialog              = New-Object system.Windows.Forms.Button
 $btn_IrqAffinityDialog.text         = "IRQ & Affinity3333"
@@ -3099,6 +3097,117 @@ $btn_ToggleAutotune.Add_Click({
 
 Add-Type -AssemblyName Microsoft.VisualBasic | Out-Null
 
+function Show-QoSCustomDialog {
+    $dlg                 = New-Object System.Windows.Forms.Form
+    $dlg.Text            = "QoS Custom"
+    $dlg.Size            = New-Object System.Drawing.Size(320,260)
+    $dlg.StartPosition   = "CenterParent"
+    $dlg.BackColor       = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+    $dlg.Font            = New-Object System.Drawing.Font('Calibri',10)
+    $dlg.ForeColor       = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox     = $false
+    $dlg.MinimizeBox     = $false
+
+    $lblName        = New-Object System.Windows.Forms.Label
+    $lblName.Text   = "Policy name"
+    $lblName.AutoSize = $true
+    $lblName.Location = New-Object System.Drawing.Point(15,20)
+    $dlg.Controls.Add($lblName)
+
+    $tbName         = New-Object System.Windows.Forms.TextBox
+    $tbName.Size    = New-Object System.Drawing.Size(250,24)
+    $tbName.Location= New-Object System.Drawing.Point(15,40)
+    $tbName.Text    = "QoS-MyGame"
+    $dlg.Controls.Add($tbName)
+
+    $lblExe         = New-Object System.Windows.Forms.Label
+    $lblExe.Text    = "Executable name"
+    $lblExe.AutoSize= $true
+    $lblExe.Location= New-Object System.Drawing.Point(15,70)
+    $dlg.Controls.Add($lblExe)
+
+    $tbExe          = New-Object System.Windows.Forms.TextBox
+    $tbExe.Size     = New-Object System.Drawing.Size(250,24)
+    $tbExe.Location = New-Object System.Drawing.Point(15,90)
+    $tbExe.Text     = "game.exe"
+    $dlg.Controls.Add($tbExe)
+
+    $lblProtocol    = New-Object System.Windows.Forms.Label
+    $lblProtocol.Text= "IP Protocol"
+    $lblProtocol.AutoSize = $true
+    $lblProtocol.Location = New-Object System.Drawing.Point(15,120)
+    $dlg.Controls.Add($lblProtocol)
+
+    $cmbProto       = New-Object System.Windows.Forms.ComboBox
+    $cmbProto.DropDownStyle = 'DropDownList'
+    @('UDP','TCP') | ForEach-Object { [void]$cmbProto.Items.Add($_) }
+    $cmbProto.SelectedIndex = 0
+    $cmbProto.Size     = New-Object System.Drawing.Size(80,24)
+    $cmbProto.Location = New-Object System.Drawing.Point(15,140)
+    $dlg.Controls.Add($cmbProto)
+
+    $lblPriority    = New-Object System.Windows.Forms.Label
+    $lblPriority.Text= "Priority"
+    $lblPriority.AutoSize = $true
+    $lblPriority.Location = New-Object System.Drawing.Point(110,120)
+    $dlg.Controls.Add($lblPriority)
+
+    $cmbPrio        = New-Object System.Windows.Forms.ComboBox
+    $cmbPrio.DropDownStyle = 'DropDownList'
+    @(0,1,2,3,4,5,6,7) | ForEach-Object { [void]$cmbPrio.Items.Add($_) }
+    $cmbPrio.SelectedItem = 5
+    $cmbPrio.Size     = New-Object System.Drawing.Size(80,24)
+    $cmbPrio.Location = New-Object System.Drawing.Point(110,140)
+    $dlg.Controls.Add($cmbPrio)
+
+    $lblDscp        = New-Object System.Windows.Forms.Label
+    $lblDscp.Text   = "DSCP value"
+    $lblDscp.AutoSize = $true
+    $lblDscp.Location = New-Object System.Drawing.Point(205,120)
+    $dlg.Controls.Add($lblDscp)
+
+    $numDscp            = New-Object System.Windows.Forms.NumericUpDown
+    $numDscp.Minimum    = 0
+    $numDscp.Maximum    = 63
+    $numDscp.Value      = 46
+    $numDscp.Location   = New-Object System.Drawing.Point(205,140)
+    $numDscp.Size       = New-Object System.Drawing.Size(60,24)
+    $dlg.Controls.Add($numDscp)
+
+    $btnOk              = New-Object System.Windows.Forms.Button
+    $btnOk.Text         = "Apply"
+    $btnOk.Size         = New-Object System.Drawing.Size(100,28)
+    $btnOk.Location     = New-Object System.Drawing.Point(80,180)
+    $btnOk.ForeColor    = $ColorActionText
+    $btnOk.BackColor    = $ColorQuickAction
+    $btnOk.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $dlg.AcceptButton   = $btnOk
+    $dlg.Controls.Add($btnOk)
+
+    $btnCancel              = New-Object System.Windows.Forms.Button
+    $btnCancel.Text         = "Cancel"
+    $btnCancel.Size         = New-Object System.Drawing.Size(100,28)
+    $btnCancel.Location     = New-Object System.Drawing.Point(190,180)
+    $btnCancel.ForeColor    = $ColorPrimary
+    $btnCancel.BackColor    = $ColorSurface
+    $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $dlg.CancelButton       = $btnCancel
+    $dlg.Controls.Add($btnCancel)
+
+    if ($dlg.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return $null }
+
+    $result = [pscustomobject]@{
+        Name     = $tbName.Text.Trim()
+        Exe      = $tbExe.Text.Trim()
+        Protocol = [string]$cmbProto.SelectedItem
+        Priority = [int]$cmbPrio.SelectedItem
+        DSCP     = [int]$numDscp.Value
+    }
+    if ([string]::IsNullOrWhiteSpace($result.Name) -or [string]::IsNullOrWhiteSpace($result.Exe)) { return $null }
+    return $result
+}
+
 $btn_QoS_BF6.Add_Click({
     $sel = $cb_QoS_Preset.SelectedItem
     if ([string]::IsNullOrWhiteSpace($sel)) { return }
@@ -3112,11 +3221,9 @@ $btn_QoS_Multi.Add_Click({
 })
 
 $btn_QoS_Custom.Add_Click({
-    $pname = [Microsoft.VisualBasic.Interaction]::InputBox("Nome policy (es. QoS-MyGame)","QoS Custom","QoS-MyGame")
-    if ([string]::IsNullOrWhiteSpace($pname)) { return }
-    $exe   = [Microsoft.VisualBasic.Interaction]::InputBox("Nome eseguibile (es. game.exe)","QoS Custom","game.exe")
-    if ([string]::IsNullOrWhiteSpace($exe)) { return }
-    Apply-QoS-Custom -PolicyName $pname -ExeName $exe
+    $c = Show-QoSCustomDialog
+    if (-not $c) { return }
+    Apply-QoS-Custom -PolicyName $c.Name -ExeName $c.Exe -Protocol $c.Protocol -Priority $c.Priority -DSCP $c.DSCP
     Refresh-QoSListBox -ListBox $lst_QoS
 })
 
