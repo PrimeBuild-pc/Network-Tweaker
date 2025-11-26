@@ -50,7 +50,7 @@ irm https://github.com/PrimeBuild-pc/Network-Tweaker/raw/main/Network_Tweaker_PB
 ---
 
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/a7db4c6b-aaf7-4b0a-8a6d-3f6ed98bd4f3" alt="Network Tweaker PB GUI" width="800" />
+  <img width="2091" height="1111" alt="image" src="https://github.com/user-attachments/assets/f94f5531-8c44-48ab-bb79-3de817f9b6ac" />
   <br><br>
   <em>Interfaccia grafica semplice e potente</em>
 </p>
