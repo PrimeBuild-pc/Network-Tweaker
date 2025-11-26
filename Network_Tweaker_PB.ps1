@@ -1,0 +1,7729 @@
+<# 
+.NAME
+    Tweaking Adapter
+#>
+
+Add-Type -AssemblyName System.Windows.Forms
+[System.Windows.Forms.Application]::EnableVisualStyles()
+
+# === Backup base dir ===
+$Global:BackupDir = Join-Path $PSScriptRoot 'Backups'
+if (-not (Test-Path $Global:BackupDir)) { New-Item -Path $Global:BackupDir -ItemType Directory | Out-Null }
+
+function Get-TimeStamp { Get-Date -Format "yyyyMMdd_HHmmss" }
+
+function Start-ConsoleTest {
+    param(
+        [string]$Command,
+        [string]$Title
+    )
+    try {
+        Start-Process -FilePath "powershell.exe" -ArgumentList "-NoExit","-Command","Write-Host '$Title' -ForegroundColor Cyan; $Command" | Out-Null
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show("Impossibile avviare il test: $($_.Exception.Message)","Test",[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+    }
+}
+
+# --- QoS helpers ---
+function Ensure-NetQosModule {
+    try { Import-Module NetQos -ErrorAction Stop } catch {}
+}
+    # ===== NIC Extras: RSC (OS) + Flow Control (driver) =====
+
+function Get-NicsForExtras {
+    Get-NetAdapter | Where-Object { $_.HardwareInterface -eq $true } | Sort-Object Name
+}
+
+function Get-FlowControlProperty {
+    param([string]$NicName)
+    try {
+        $props = Get-NetAdapterAdvancedProperty -Name $NicName -ErrorAction Stop
+    } catch { return $null }
+
+    # Heuristics: vari driver espongono nomi diversi. Prova per DisplayName e RegistryKeyword.
+    $cand = $props | Where-Object {
+        $_.DisplayName -match 'Flow\s*Control' -or $_.RegistryKeyword -match 'FlowControl'
+    }
+
+    if (-not $cand -or $cand.Count -eq 0) { return $null }
+    # Prendi quello più "Flow Control" esplicito
+    return $cand | Select-Object -First 1
+}
+
+function Set-FlowControl {
+    param([string]$NicName,[ValidateSet('On','Off')]$State)
+    $prop = Get-FlowControlProperty -NicName $NicName
+    if (-not $prop) { throw "Proprieta' Flow Control non trovata sul driver di '$NicName'." }
+
+    # Mapping valori più comuni Intel:
+    # 0 = Disabled, 1 = Rx Enabled, 2 = Tx Enabled, 3 = Rx & Tx Enabled
+    $target = if ($State -eq 'Off') { 0 } else { 3 }
+
+    try {
+        if ($prop.RegistryKeyword) {
+            Set-NetAdapterAdvancedProperty -Name $NicName -RegistryKeyword $prop.RegistryKeyword -RegistryValue $target -NoRestart -ErrorAction Stop | Out-Null
+        } elseif ($prop.DisplayName) {
+            # Alcuni driver accettano -DisplayValue string; tentativo di fallback
+            $displayValue = if ($State -eq 'Off') { 'Disabled' } else { 'Rx & Tx Enabled' }
+            Set-NetAdapterAdvancedProperty -Name $NicName -DisplayName $prop.DisplayName -DisplayValue $displayValue -NoRestart -ErrorAction Stop | Out-Null
+        } else {
+            throw "Impossibile impostare Flow Control (nessuna chiave supportata)."
+        }
+        return $true
+    } catch {
+        throw "Errore impostando Flow Control su '$NicName': $($_.Exception.Message)"
+    }
+}
+
+function Get-RscStatus {
+    param([string]$NicName)
+    try {
+        $r = Get-NetAdapterRsc -Name $NicName -ErrorAction Stop
+        # True se abilitato su IPv4 o IPv6
+        $on = ($r.IPv4Enabled -or $r.IPv6Enabled)
+        return @{ Enabled=$on; Raw=$r }
+    } catch {
+        return @{ Enabled=$false; Raw=$null }
+    }
+}
+
+function Enable-RSC {
+    param([string]$NicName)
+    try {
+        Enable-NetAdapterRsc -Name $NicName -ErrorAction Stop | Out-Null
+        return $true
+    } catch {
+        throw "Errore abilitando RSC su '$NicName': $($_.Exception.Message)"
+    }
+}
+
+function Disable-RSC {
+    param([string]$NicName)
+    try {
+        Disable-NetAdapterRsc -Name $NicName -ErrorAction Stop | Out-Null
+        return $true
+    } catch {
+        throw "Errore disabilitando RSC su '$NicName': $($_.Exception.Message)"
+    }
+}
+
+# ===== ACK Tweaks (per-NIC) =====
+
+function Get-InterfaceRegPath {
+    param([string]$NicName)
+    
+    if ([string]::IsNullOrWhiteSpace($NicName)) { 
+        return $null 
+    }
+    
+    try {
+        $nic = Get-NetAdapter -Name $NicName -ErrorAction Stop
+        if (-not $nic) { return $null }
+        
+        $guidB = $nic.InterfaceGuid.ToString("B").ToUpper() # {GUID}
+        return "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\$guidB"
+    } catch {
+        Write-Warning "Get-InterfaceRegPath error for $NicName : $($_.Exception.Message)"
+        return $null
+    }
+}
+function Get-AckValues {
+    param([string]$NicName)
+    $p = Get-InterfaceRegPath -NicName $NicName
+    if (-not $p) { return $null }
+    $obj = [PSCustomObject]@{
+        Path            = $p
+        TcpAckFrequency = $null
+        TCPNoDelay      = $null
+        TcpDelAckTicks  = $null
+    }
+    try { $v = Get-ItemProperty -Path $p -ErrorAction Stop } catch { return $obj }
+    foreach ($k in 'TcpAckFrequency','TCPNoDelay','TcpDelAckTicks') {
+        if ($v.PSObject.Properties.Name -contains $k) { $obj.$k = [uint32]$v.$k }
+    }
+    return $obj
+}
+
+function Backup-AckIfNeeded {
+    param([string]$NicName)
+    Ensure-BackupKey
+    $safe = $NicName.Replace(':','_').Replace(' ','_')
+    foreach ($k in 'TcpAckFrequency','TCPNoDelay','TcpDelAckTicks') {
+        $bkName = "ACK_${safe}_$k"
+        try { $null = Get-ItemProperty -Path $PB_BackupKey -Name $bkName -ErrorAction Stop } catch {
+            $cur = (Get-AckValues -NicName $NicName).$k
+            if ($null -ne $cur) {
+                New-ItemProperty -Path $PB_BackupKey -Name $bkName -PropertyType DWord -Value $cur -Force | Out-Null
+            }
+        }
+    }
+}
+
+function Set-InterfaceDword {
+    param([string]$Path,[string]$Name,[uint32]$Value)
+    New-Item -Path $Path -Force | Out-Null
+    New-ItemProperty -Path $Path -Name $Name -PropertyType DWord -Value $Value -Force | Out-Null
+}
+
+function Apply-AckGaming {
+    param([string[]]$NicNames)
+    $ok = $true
+    foreach ($n in $NicNames) {
+        $p = Get-InterfaceRegPath -NicName $n
+        if (-not $p) { $ok = $false; continue }
+        try {
+            Backup-AckIfNeeded -NicName $n
+            # Valori "gaming" tipici: ACK immediati + Nagle off + ritardo ACK minimo
+            Set-InterfaceDword -Path $p -Name 'TcpAckFrequency' -Value 1
+            Set-InterfaceDword -Path $p -Name 'TCPNoDelay'      -Value 1
+            Set-InterfaceDword -Path $p -Name 'TcpDelAckTicks'  -Value 0
+        } catch { $ok = $false }
+    }
+    return $ok
+}
+
+function Revert-Ack {
+    param([string[]]$NicNames)
+    $ok = $true
+    foreach ($n in $NicNames) {
+        $p = Get-InterfaceRegPath -NicName $n
+        if (-not $p) { $ok = $false; continue }
+        $safe = $n.Replace(':','_').Replace(' ','_')
+        foreach ($k in 'TcpAckFrequency','TCPNoDelay','TcpDelAckTicks') {
+            $bkName = "ACK_${safe}_$k"
+            try {
+                $bkVal = (Get-ItemProperty -Path $PB_BackupKey -Name $bkName -ErrorAction Stop).$bkName
+                if ($null -ne $bkVal) {
+                    Set-InterfaceDword -Path $p -Name $k -Value ([uint32]$bkVal)
+                } else {
+                    Remove-ItemProperty -Path $p -Name $k -ErrorAction SilentlyContinue
+                }
+            } catch {
+                # Nessun backup: rimuovi la chiave per tornare al default
+                Remove-ItemProperty -Path $p -Name $k -ErrorAction SilentlyContinue
+            }
+        }
+    }
+    return $ok
+}
+
+# ===== Security (SAFE / ADVANCED / REVERT) =====
+
+function Invoke-Netsh {
+    param([string]$Args)
+    & netsh.exe $Args 2>$null | Out-Null
+}
+
+function Set-RegDword {
+    param([string]$Path,[string]$Name,[uint32]$Value)
+    New-Item -Path $Path -Force | Out-Null
+    New-ItemProperty -Path $Path -Name $Name -PropertyType DWord -Value $Value -Force | Out-Null
+}
+
+function Remove-FirewallRulesByName {
+    param([string[]]$Names)
+    foreach ($n in $Names) {
+        Invoke-Netsh ("advfirewall firewall delete rule name='{0}'" -f $n)
+    }
+}
+
+function Revert-TcpGlobals {
+    try {
+        & netsh int tcp set global autotuning=normal   > $null
+        & netsh int tcp set supplemental template=internet congestionprovider=default > $null
+        & netsh int tcp set global ecncapability=default   > $null
+        & netsh int tcp set global hystart=default         > $null
+        & netsh int tcp set global timestamps=default      > $null
+        & netsh int tcp set global pacingprofile=off       > $null
+        & netsh int tcp set global initialrto=default      > $null
+        return $true
+    } catch { return $false }
+}
+
+function Revert-IRQAll {
+    $ok = $true
+    $nics = Get-NetAdapter | Where-Object { $_.HardwareInterface -eq $true }
+    foreach ($n in $nics) {
+        try {
+            Disable-NetAdapterRss -Name $n.Name -ErrorAction SilentlyContinue | Out-Null
+            Enable-NetAdapterRss  -Name $n.Name -ErrorAction SilentlyContinue | Out-Null
+
+            $w = Get-WmiObject Win32_NetworkAdapter -Filter ("GUID='{0}'" -f $n.InterfaceGuid.ToString("B").ToUpper())
+            if ($w) {
+                $msiPath = "HKLM:\SYSTEM\CurrentControlSet\Enum\$($w.PNPDeviceID)\Device Parameters\Interrupt Management\MessageSignaledInterruptProperties"
+                $bkName  = ("MSI_{0}" -f $n.Name).Replace(':','_').Replace(' ','_')
+                try {
+                    $bkVal = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\PrimeBuild\NetworkTweaker\Backups' -Name $bkName -ErrorAction Stop).$bkName
+                    New-Item -Path $msiPath -Force | Out-Null
+                    New-ItemProperty -Path $msiPath -Name 'MSISupported' -PropertyType DWord -Value $bkVal -Force | Out-Null
+                } catch { }
+            }
+        } catch { $ok = $false }
+    }
+    return $ok
+}
+
+function Revert-AckAll {
+    $nics = Get-NetAdapter | Where-Object { $_.HardwareInterface -eq $true } | ForEach-Object Name
+    if (-not $nics -or $nics.Count -eq 0) { return $true }
+    return (Revert-Ack -NicNames $nics)
+}
+
+function Get-TcpStatusText {
+    $g = (netsh int tcp show global) -join "`n"
+    $s = (netsh int tcp show supplemental) -join "`n"
+    $auto = ($g | Select-String -Pattern 'Receive Window Auto-Tuning Level').ToString()
+    $ecn  = ($g | Select-String -Pattern 'ECN').ToString()
+    $hys  = ($g | Select-String -Pattern 'HyStart').ToString()
+    $tst  = ($g | Select-String -Pattern 'Timestamps').ToString()
+    $pp   = ($g | Select-String -Pattern 'Pacing Profile').ToString()
+    $rto  = ($g | Select-String -Pattern 'Initial RTO').ToString()
+    if ($s -match 'Congestion Provider.*?:\s*(.+)$') {
+        $cc = ($Matches[1]).Trim()
+    } else {
+        $cc = '(n/d)'
+    }
+
+    $lines = @(
+        'TCP:'
+        "  $auto"
+        "  $ecn"
+        "  $hys"
+        "  $tst"
+        "  $pp"
+        "  $rto"
+        "  Congestion Provider: $cc"
+    )
+    return ($lines -join "`r`n")
+}
+
+function Get-QoSStatusText {
+    try {
+        $p = Get-NetQosPolicy -PolicyStore ActiveStore
+        if (-not $p) { return 'QoS: nessuna policy in ActiveStore.' }
+        $names = $p | Select-Object -ExpandProperty Name | Sort-Object
+        return "QoS (" + $names.Count + "): " + ($names -join ', ')
+    } catch { return 'QoS: (errore/nessun modulo)' }
+}
+
+function Get-MmcssStatusBlock {
+    return "MMCSS: " + (Get-MmcssStatusText)
+}
+
+function Get-NicQuickStatus {
+    $rows = @()
+    $nics = Get-NetAdapter | Where-Object { $_.HardwareInterface -eq $true } | Sort-Object Name
+    foreach ($n in $nics) {
+        $rss = $null; try { $rss = Get-NetAdapterRss -Name $n.Name -ErrorAction Stop } catch {}
+        if ($rss) {
+            $rssTxt = "RSS: {0}-{1}" -f $rss.BaseProcessorNumber,$rss.MaxProcessorNumber
+        } else {
+            $rssTxt = 'RSS: (n/d)'
+        }
+
+        $rsc = Get-RscStatus -NicName $n.Name
+        if ($rsc -and $rsc.Enabled) {
+            $rscTxt = 'RSC: ON'
+        } else {
+            $rscTxt = 'RSC: OFF'
+        }
+
+        $fcP = Get-FlowControlProperty -NicName $n.Name
+        if ($fcP) {
+            if ($fcP.DisplayValue) {
+                $cur = $fcP.DisplayValue
+            } elseif ($fcP.RegistryValue -ne $null) {
+                $cur = $fcP.RegistryValue
+            } else {
+                $cur = '(n/d)'
+            }
+            $fcTxt = "FlowControl: $cur"
+        } else {
+            $fcTxt = 'FlowControl: (n/d)'
+        }
+
+        $rows += ("- {0}  -  {1} | {2} | {3} | {4}" -f $n.Name,$n.InterfaceDescription,$rssTxt,$rscTxt,$fcTxt)
+    }
+    if ($rows.Count -eq 0) { return 'NICs: (nessuna NIC fisica rilevata)' }
+    return "NICs:`n" + ($rows -join "`n")
+}
+
+function Build-StatusReport {
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine( (Get-TcpStatusText) )
+    [void]$sb.AppendLine( (Get-QoSStatusText) )
+    [void]$sb.AppendLine( (Get-MmcssStatusBlock) )
+    [void]$sb.AppendLine( (Get-NicQuickStatus) )
+    return $sb.ToString()
+}
+
+function Apply-SecuritySAFE {
+    try {
+        Invoke-Netsh 'advfirewall firewall set rule group="Network Discovery" new enable=No'
+        Set-RegDword -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\NetBT\Parameters' -Name 'EnableLMHOSTS' -Value 0
+        Invoke-Netsh 'advfirewall firewall add rule name="PrimeBuild Block NetBIOS UDP 137" dir=in action=block protocol=UDP localport=137'
+        Invoke-Netsh 'advfirewall firewall add rule name="PrimeBuild Block NetBIOS UDP 138" dir=in action=block protocol=UDP localport=138'
+        Invoke-Netsh 'advfirewall firewall add rule name="PrimeBuild Block NetBIOS TCP 139" dir=in action=block protocol=TCP localport=139'
+        Invoke-Netsh 'advfirewall firewall add rule name="PrimeBuild Block SMBv1 TCP 445" dir=in action=block protocol=TCP localport=445'
+        return $true
+    } catch { return $false }
+}
+
+function Apply-SecurityADV {
+    try {
+        [void](Apply-SecuritySAFE)
+        Invoke-Netsh 'advfirewall set allprofiles firewallpolicy blockinbound,allowoutbound'
+        Set-RegDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient' -Name 'EnableMulticast' -Value 0
+        Invoke-Netsh 'advfirewall firewall add rule name="PrimeBuild Block mDNS UDP IN"  protocol=UDP localport=5353 dir=in  action=block'
+        Invoke-Netsh 'advfirewall firewall add rule name="PrimeBuild Block mDNS UDP OUT" protocol=UDP localport=5353 dir=out action=block'
+        Invoke-Netsh 'advfirewall firewall add rule name="PrimeBuild Block LPD TCP"      protocol=TCP localport=515  dir=in  action=block'
+        Invoke-Netsh 'advfirewall firewall add rule name="PrimeBuild Block RDP TCP"      protocol=TCP localport=3389 dir=in action=block'
+        Set-RegDword -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Remote Assistance' -Name 'fAllowToGetHelp' -Value 0
+        sc.exe stop RemoteRegistry  | Out-Null
+        sc.exe config RemoteRegistry start= disabled | Out-Null
+        Set-RegDword -Path 'HKLM:\Software\Microsoft\Windows Script Host\Settings' -Name 'Enabled' -Value 0
+        try { Disable-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -NoRestart -ErrorAction Stop | Out-Null } catch {}
+        sc.exe stop  fdPHost | Out-Null
+        sc.exe config fdPHost start= disabled | Out-Null
+        sc.exe stop  FDResPub | Out-Null
+        sc.exe config FDResPub start= disabled | Out-Null
+        return $true
+    } catch { return $false }
+}
+
+function Revert-SecurityPB {
+    try {
+        Invoke-Netsh 'advfirewall firewall set rule group="Network Discovery" new enable=Yes'
+        Set-RegDword -Path 'HKLM:\SYSTEM\CurrentControlSet\Services\NetBT\Parameters' -Name 'EnableLMHOSTS' -Value 1
+        Remove-FirewallRulesByName @(
+            'PrimeBuild Block NetBIOS UDP 137',
+            'PrimeBuild Block NetBIOS UDP 138',
+            'PrimeBuild Block NetBIOS TCP 139',
+            'PrimeBuild Block SMBv1 TCP 445',
+            'PrimeBuild Block mDNS UDP IN',
+            'PrimeBuild Block mDNS UDP OUT',
+            'PrimeBuild Block LPD TCP',
+            'PrimeBuild Block RDP TCP'
+        )
+        Set-RegDword -Path 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient' -Name 'EnableMulticast' -Value 1
+        Set-RegDword -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Remote Assistance' -Name 'fAllowToGetHelp' -Value 1
+        sc.exe config RemoteRegistry start= demand | Out-Null
+        Set-RegDword -Path 'HKLM:\Software\Microsoft\Windows Script Host\Settings' -Name 'Enabled' -Value 1
+        sc.exe config fdPHost start= demand | Out-Null
+        sc.exe config FDResPub start= demand | Out-Null
+        Invoke-Netsh 'advfirewall set allprofiles firewallpolicy allowinbound,allowoutbound'
+        return $true
+    } catch { return $false }
+}
+
+function Get-SecurityStatusText {
+    try {
+        $lmhosts = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Services\NetBT\Parameters' -Name EnableLMHOSTS -ErrorAction SilentlyContinue).EnableLMHOSTS
+        $llmnr  = (Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\DNSClient' -Name EnableMulticast -ErrorAction SilentlyContinue).EnableMulticast
+        $wsh    = (Get-ItemProperty 'HKLM:\Software\Microsoft\Windows Script Host\Settings' -Name Enabled -ErrorAction SilentlyContinue).Enabled
+        $rr     = (Get-Service RemoteRegistry -ErrorAction SilentlyContinue)
+        $fd1    = (Get-Service fdPHost      -ErrorAction SilentlyContinue)
+        $fd2    = (Get-Service FDResPub     -ErrorAction SilentlyContinue)
+        $smb1   = $null; try { $smb1 = (Get-WindowsOptionalFeature -Online -FeatureName SMB1Protocol -ErrorAction Stop).State } catch {}
+        $fwprof = Get-NetFirewallProfile
+        $fwInbound = ($fwprof | Select-Object -First 1 -ExpandProperty DefaultInboundAction)
+        $a = @()
+        $a += ('LMHOSTS: ' + $(if ($lmhosts -eq 0) {'OFF'} elseif ($lmhosts -eq 1) {'ON'} else {'(n/d)'}))
+        $a += ('LLMNR: '   + $(if ($llmnr  -eq 0) {'OFF'} elseif ($llmnr  -eq 1) {'ON'} else {'(n/d)'}))
+        $a += ('WSH: '     + $(if ($wsh    -eq 0) {'OFF'} elseif ($wsh    -eq 1) {'ON'} else {'(n/d)'}))
+        $a += ('RemoteRegistry: ' + $(if ($rr) { $rr.StartType } else {'(n/d)'}))
+        $a += ('FD Services: '    + $(if ($fd1 -and $fd2) { ($fd1.StartType.ToString() + '/' + $fd2.StartType.ToString()) } else {'(n/d)'}))
+        $a += ('SMB1: ' + $(if ($smb1) { $smb1 } else {'(n/d)'}))
+        $a += ('FW inbound default: ' + $(if ($fwInbound -eq 'Block') {'Block'} else {'Allow'}))
+        return ($a -join '  |  ')
+    } catch { return '(n/d)' }
+}
+
+function Get-QoSPoliciesNames {
+    Ensure-NetQosModule
+    try {
+        return (Get-NetQosPolicy | Select-Object -ExpandProperty Name)
+    } catch { return @() }
+}
+
+function Refresh-QoSListBox {
+    param([System.Windows.Forms.ListBox]$ListBox)
+    if (-not $ListBox) { return }
+    $ListBox.Items.Clear()
+    foreach ($n in (Get-QoSPoliciesNames | Sort-Object)) { [void]$ListBox.Items.Add($n) }
+    if ($ListBox.Items.Count -eq 0) { [void]$ListBox.Items.Add('(nessuna policy QoS attiva)') }
+}
+
+function New-QoS-AppPair {
+    param(
+        [Parameter(Mandatory=$true)][string]$NameBase,
+        [Parameter(Mandatory=$true)][string]$Exe,
+        [ValidateSet('UDP','TCP')][string]$Protocol = 'UDP',
+        [int]$Prio = 5,
+        [int]$DSCP = 46
+    )
+    Ensure-NetQosModule
+    try {
+        New-NetQosPolicy -Name $NameBase -AppPathNameMatchCondition $Exe -IPProtocolMatchCondition $Protocol -PriorityValue8021Action $Prio -DSCPAction $DSCP -NetworkProfile All -Precedence 127 -PolicyStore ActiveStore -ErrorAction Stop | Out-Null
+    } catch {}
+}
+
+$Global:QoSGamePresets = @(
+    @{ Display='Battlefield 6';     Name='BF6-UDP-Priority';        Exe='bf6.exe' },
+    @{ Display='Fortnite';          Name='QoS-Fortnite';             Exe='FortniteClient-Win64-Shipping.exe' },
+    @{ Display='Marvel Rivals';     Name='QoS-MarvelRivals';         Exe='Marvel-Win64-Shipping.exe' },
+    @{ Display='League of Legends'; Name='QoS-LeagueOfLegends';      Exe='League of Legends.exe' },
+    @{ Display='CS2';               Name='QoS-CS2';                  Exe='cs2.exe' },
+    @{ Display='VALORANT';          Name='QoS-VALORANT';             Exe='VALORANT-Win64-Shipping.exe' },
+    @{ Display='Call of Duty';      Name='QoS-COD';                  Exe='cod.exe' },
+    @{ Display='ARC Raiders';       Name='QoS-ARC-Raiders';          Exe='PioneerGame.exe' }
+)
+
+function Apply-QoS-Preset {
+    param([string]$PresetName)
+    if ([string]::IsNullOrWhiteSpace($PresetName)) { return }
+    $preset = $Global:QoSGamePresets | Where-Object { $_.Display -eq $PresetName } | Select-Object -First 1
+    if (-not $preset) { return }
+    New-QoS-AppPair -NameBase $preset.Name -Exe $preset.Exe -Protocol 'UDP' -Prio 5 -DSCP 46
+}
+
+function Apply-QoS-BF6 {
+    Apply-QoS-Preset -PresetName 'Battlefield 6'
+}
+
+function Apply-QoS-MultiApp {
+    foreach ($a in $Global:QoSGamePresets) {
+        New-QoS-AppPair -NameBase $a.Name -Exe $a.Exe -Protocol 'UDP' -Prio 5 -DSCP 46
+    }
+}
+
+function Apply-QoS-Custom {
+    param([string]$PolicyName, [string]$ExeName,[ValidateSet('UDP','TCP')][string]$Protocol = 'UDP',[int]$Priority = 5,[int]$DSCP = 46)
+    if ([string]::IsNullOrWhiteSpace($PolicyName) -or [string]::IsNullOrWhiteSpace($ExeName)) { return }
+    New-QoS-AppPair -NameBase $PolicyName -Exe $ExeName -Protocol $Protocol -Prio $Priority -DSCP $DSCP
+}
+
+function Remove-QoS-All {
+    Ensure-NetQosModule
+    try {
+        $names = Get-NetQosPolicy -PolicyStore ActiveStore | Where-Object {
+            $_.Name -like 'QoS-*' -or
+            $_.Name -like 'PrimeBuild-*' -or
+            $_.Name -eq 'BF6-UDP-Priority' -or
+            $_.Name -eq 'BF6-UDP-DSCP'
+        } | Select-Object -ExpandProperty Name
+        foreach ($n in $names) {
+            try { Remove-NetQosPolicy -Name $n -PolicyStore ActiveStore -Confirm:$false -ErrorAction Stop | Out-Null } catch {}
+        }
+    } catch {}
+}
+
+# === NDIS & MMCSS (NetworkThrottlingIndex / SystemResponsiveness) ===
+
+$PB_BackupKey = 'HKLM:\SOFTWARE\PrimeBuild\NetworkTweaker\Backups'
+$MMCSS_Key    = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile'
+
+function Ensure-BackupKey {
+    if (-not (Test-Path $PB_BackupKey)) { New-Item -Path $PB_BackupKey -Force | Out-Null }
+}
+
+function Get-RegistryDword {
+    param([string]$Path,[string]$Name)
+    try {
+        $val = Get-ItemProperty -Path $Path -Name $Name -ErrorAction Stop
+        return [uint32]$val.$Name
+    } catch { return $null }
+}
+
+function Set-RegistryDword {
+    param([string]$Path,[string]$Name,[uint32]$Value)
+    New-Item -Path $Path -Force | Out-Null
+    New-ItemProperty -Path $Path -Name $Name -PropertyType DWord -Value $Value -Force | Out-Null
+}
+
+function Backup-MmcssIfNeeded {
+    Ensure-BackupKey
+    $curNTI = Get-RegistryDword -Path $MMCSS_Key -Name 'NetworkThrottlingIndex'
+    $curSR  = Get-RegistryDword -Path $MMCSS_Key -Name 'SystemResponsiveness'
+    if ($null -ne $curNTI -and $null -eq (Get-RegistryDword -Path $PB_BackupKey -Name 'NetworkThrottlingIndex')) {
+        Set-RegistryDword -Path $PB_BackupKey -Name 'NetworkThrottlingIndex' -Value $curNTI
+    }
+    if ($null -ne $curSR -and $null -eq (Get-RegistryDword -Path $PB_BackupKey -Name 'SystemResponsiveness')) {
+        Set-RegistryDword -Path $PB_BackupKey -Name 'SystemResponsiveness' -Value $curSR
+    }
+}
+
+function Apply-NdisMmcssOptimizations {
+    try {
+        Backup-MmcssIfNeeded
+        Set-RegistryDword -Path $MMCSS_Key -Name 'NetworkThrottlingIndex' -Value 0xFFFFFFFF
+        Set-RegistryDword -Path $MMCSS_Key -Name 'SystemResponsiveness'  -Value 0
+        [System.Windows.Forms.MessageBox]::Show("NDIS and MMCSS applicati:`n- NetworkThrottlingIndex = 0xFFFFFFFF`n- SystemResponsiveness  = 0`n(riavvio consigliato)","NDIS and MMCSS",
+            [System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+        return $true
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show("Errore applicando NDIS and MMCSS: $($_.Exception.Message)","Errore",
+            [System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+        return $false
+    }
+}
+
+function Revert-NdisMmcssOptimizations {
+    try {
+        $bakNTI = Get-RegistryDword -Path $PB_BackupKey -Name 'NetworkThrottlingIndex'
+        $bakSR  = Get-RegistryDword -Path $PB_BackupKey -Name 'SystemResponsiveness'
+
+        if ($null -eq $bakNTI) { $bakNTI = 10 }
+        if ($null -eq $bakSR)  { $bakSR  = 20 }
+
+        Set-RegistryDword -Path $MMCSS_Key -Name 'NetworkThrottlingIndex' -Value $bakNTI
+        Set-RegistryDword -Path $MMCSS_Key -Name 'SystemResponsiveness'  -Value $bakSR
+
+        [System.Windows.Forms.MessageBox]::Show(("NDIS and MMCSS ripristinati:`n- NetworkThrottlingIndex = {0}`n- SystemResponsiveness  = {1}`n(riavvio consigliato)" -f ("0x{0:X}" -f $bakNTI), $bakSR),"Ripristino",
+            [System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+        return $true
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show("Errore nel ripristino NDIS and MMCSS: $($_.Exception.Message)","Errore",
+            [System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+        return $false
+    }
+}
+
+function Get-MmcssStatusText {
+    $nti = Get-RegistryDword -Path $MMCSS_Key -Name 'NetworkThrottlingIndex'
+    $sr  = Get-RegistryDword -Path $MMCSS_Key -Name 'SystemResponsiveness'
+    if ($null -eq $nti -and $null -eq $sr) { return "NTI: (n/d)  |  SR: (n/d)" }
+    $ntiHex = if ($null -ne $nti) { "0x{0:X}" -f $nti } else { "(n/d)" }
+    $srTxt  = if ($null -ne $sr)  { "$sr" } else { "(n/d)" }
+    return "NTI: $ntiHex  |  SR: $srTxt"
+}
+
+function Get-TcpAutoTuningState {
+    $line = (netsh int tcp show global) | Select-String -Pattern 'Receive Window Auto-Tuning Level'
+    if ($line) {
+        return ($line -split ':')[-1].Trim().ToUpper()
+    }
+    return 'UNKNOWN'
+}
+
+function Set-TcpPreset {
+    param(
+        [ValidateSet('SAFE','BALANCED','AGGRESSIVE')]
+        [string]$Preset
+    )
+    try {
+        $tmpG = [IO.Path]::GetTempFileName()
+        $tmpS = [IO.Path]::GetTempFileName()
+        netsh int tcp show global       > $tmpG
+        netsh int tcp show supplemental > $tmpS
+
+        switch ($Preset) {
+            'SAFE' {
+                & netsh int tcp set global autotuning=normal                                           >$null
+                & netsh int tcp set supplemental template=internet congestionprovider=default          >$null
+                & netsh int tcp set global ecncapability=enabled                                      >$null
+                & netsh int tcp set global hystart=enabled                                            >$null
+                & netsh int tcp set global timestamps=default                                         >$null
+                & netsh int tcp set global pacingprofile=off                                          >$null
+                & netsh int tcp set global initialrto=default                                         >$null
+            }
+            'BALANCED' {
+                & netsh int tcp set global autotuning=restricted                                      >$null
+                & netsh int tcp set supplemental template=internet congestionprovider=bbr2            >$null
+                & netsh int tcp set global ecncapability=enabled                                      >$null
+                & netsh int tcp set global hystart=disabled                                           >$null
+                & netsh int tcp set global timestamps=disabled                                        >$null
+                & netsh int tcp set global pacingprofile=off                                          >$null
+                & netsh int tcp set global initialrto=default                                         >$null
+            }
+            'AGGRESSIVE' {
+                & netsh int tcp set global autotuning=disable                                         >$null
+                & netsh int tcp set supplemental template=internet congestionprovider=bbr2            >$null
+                & netsh int tcp set global ecncapability=enabled                                      >$null
+                & netsh int tcp set global hystart=disabled                                           >$null
+                & netsh int tcp set global timestamps=disabled                                        >$null
+                & netsh int tcp set global pacingprofile=off                                          >$null
+                & netsh int tcp set global initialrto=1000                                            >$null
+            }
+        }
+
+        $supp = (netsh int tcp show supplemental) -join "`n"
+        if ($supp -notmatch 'BBR2') {
+            & netsh int tcp set supplemental template=internet congestionprovider=default             >$null
+        }
+
+        [System.Windows.Forms.MessageBox]::Show("TCP preset '$Preset' applicato.","TCP Preset",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+    }
+    catch {
+        [System.Windows.Forms.MessageBox]::Show("Errore applicando preset '$Preset': $($_.Exception.Message)","Errore",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+    }
+}
+
+function Toggle-TcpAutotuning {
+    try {
+        $state = Get-TcpAutoTuningState
+        if ($state -eq 'DISABLED') {
+            & netsh int tcp set global autotuning=normal                                             >$null
+        } else {
+            & netsh int tcp set global autotuning=disable                                            >$null
+        }
+        $new = Get-TcpAutoTuningState
+        return $new
+    } catch {
+        return 'UNKNOWN'
+    }
+}
+
+# ===== IRQ & Affinity (MSI + RSS pinning) =====
+
+function Get-NicsForAffinity {
+    $nics = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.HardwareInterface -eq $true }
+    $list = @()
+        foreach ($n in $nics) {
+            $w = Get-WmiObject Win32_NetworkAdapter -Filter ("GUID='{0}'" -f $n.InterfaceGuid.ToString("B").ToUpper())
+            if ($w) { 
+            $list += [PSCustomObject]@{
+                Name        = $n.Name
+                IfDesc      = $n.InterfaceDescription
+                PNPDeviceID = $w.PNPDeviceID
+            }
+        } else {
+            $list += [PSCustomObject]@{
+                Name        = $n.Name
+                IfDesc      = $n.InterfaceDescription
+                PNPDeviceID = $null
+            }
+        }
+    }
+    return $list
+}
+
+# --- NIC profile helpers (advanced properties) ---
+function Find-AdvancedProperty {
+    param($Adapter,[string[]]$Names)
+    foreach ($name in $Names) {
+        try {
+            $p = Get-NetAdapterAdvancedProperty -Name $Adapter.Name -DisplayName $name -ErrorAction Stop
+            if ($p) { return $p }
+        } catch {}
+        try {
+            $p = Get-NetAdapterAdvancedProperty -Name $Adapter.Name -RegistryKeyword $name -ErrorAction Stop
+            if ($p) { return $p }
+        } catch {}
+    }
+    return $null
+}
+
+function Set-InterruptModeration {
+    param($Adapter,[string]$Value)
+    $prop = Find-AdvancedProperty -Adapter $Adapter -Names @('Interrupt Moderation','Interrupt Moderation Rate')
+    if ($prop) {
+        Set-NetAdapterAdvancedProperty -Name $Adapter.Name -DisplayName $prop.DisplayName -DisplayValue $Value -NoRestart -ErrorAction SilentlyContinue | Out-Null
+    }
+}
+
+function Set-Buffers {
+    param($Adapter,[int]$Rx,[int]$Tx)
+    $rxProp = Find-AdvancedProperty -Adapter $Adapter -Names @('Receive Buffers','Receive Buffer')
+    $txProp = Find-AdvancedProperty -Adapter $Adapter -Names @('Transmit Buffers','Transmit Buffer')
+    if ($rxProp) { Set-NetAdapterAdvancedProperty -Name $Adapter.Name -DisplayName $rxProp.DisplayName -DisplayValue $Rx -NoRestart -ErrorAction SilentlyContinue | Out-Null }
+    if ($txProp) { Set-NetAdapterAdvancedProperty -Name $Adapter.Name -DisplayName $txProp.DisplayName -DisplayValue $Tx -NoRestart -ErrorAction SilentlyContinue | Out-Null }
+}
+
+function Enable-IfPresent {
+    param($Adapter,[string[]]$Names)
+    foreach ($name in $Names) {
+        $prop = Find-AdvancedProperty -Adapter $Adapter -Names @($name)
+        if ($prop) {
+            Set-NetAdapterAdvancedProperty -Name $Adapter.Name -DisplayName $prop.DisplayName -DisplayValue 'Enabled' -NoRestart -ErrorAction SilentlyContinue | Out-Null
+        }
+    }
+}
+
+function Disable-IfPresent {
+    param($Adapter,[string[]]$Names)
+    foreach ($name in $Names) {
+        $prop = Find-AdvancedProperty -Adapter $Adapter -Names @($name)
+        if ($prop) {
+            Set-NetAdapterAdvancedProperty -Name $Adapter.Name -DisplayName $prop.DisplayName -DisplayValue 'Disabled' -NoRestart -ErrorAction SilentlyContinue | Out-Null
+        }
+    }
+}
+
+function Apply-AdapterProfile {
+    param([string]$Preset,[string]$NicName)
+    $adapter = Get-NetAdapter -Name $NicName -ErrorAction SilentlyContinue
+    if (-not $adapter) { return $false }
+    switch ($Preset) {
+        'Realtek8111H' {
+            Set-InterruptModeration $adapter 'Off'
+            Disable-IfPresent  $adapter @('Large Send Offload','Large Send Offload v2 (IPv4)','Large Send Offload v2 (IPv6)','LSO')
+            Disable-IfPresent  $adapter @('Flow Control')
+            Disable-IfPresent  $adapter @('Green Ethernet','Power Saving Mode')
+            Set-Buffers        $adapter 1024 1024
+        }
+        'Realtek8125' {
+            Set-InterruptModeration $adapter 'Low'
+            Enable-IfPresent   $adapter @('Large Send Offload','Large Send Offload v2 (IPv4)','Large Send Offload v2 (IPv6)')
+            Disable-IfPresent  $adapter @('Flow Control')
+            Disable-IfPresent  $adapter @('Energy Efficient Ethernet','Green Ethernet','EEE')
+            Enable-IfPresent   $adapter @('RSS','Receive Side Scaling','Receive Side Scaling v2')
+            Enable-IfPresent   $adapter @('RSC (Receive Segment Coalescing)','Receive Segment Coalescing')
+            Set-Buffers        $adapter 1024 1024
+        }
+        'Realtek8126' {
+            Enable-IfPresent   $adapter @('Large Send Offload','Large Send Offload v2 (IPv4)','Large Send Offload v2 (IPv6)')
+            Enable-IfPresent   $adapter @('RSS','Receive Side Scaling')
+            Set-InterruptModeration $adapter 'Low'
+            Disable-IfPresent  $adapter @('Flow Control')
+            Enable-IfPresent   $adapter @('RSC (Receive Segment Coalescing)','Receive Segment Coalescing')
+            Set-Buffers        $adapter 1024 1024
+        }
+        'AQC107' {
+            Enable-IfPresent   $adapter @('RSS','Receive Side Scaling')
+            Enable-IfPresent   $adapter @('RSC (Receive Segment Coalescing)','Receive Segment Coalescing')
+            Set-InterruptModeration $adapter 'Low'
+            Enable-IfPresent   $adapter @('Large Send Offload','Large Send Offload v2 (IPv4)','Large Send Offload v2 (IPv6)')
+            Set-Buffers        $adapter 2048 2048
+        }
+        'Intel2p5G' {
+            Enable-IfPresent   $adapter @('RSS','Receive Side Scaling')
+            Disable-IfPresent  $adapter @('Flow Control')
+            Disable-IfPresent  $adapter @('Energy Efficient Ethernet','EEE')
+            Set-InterruptModeration $adapter 'Low'
+            Enable-IfPresent   $adapter @('Large Send Offload','Large Send Offload v2 (IPv4)','Large Send Offload v2 (IPv6)')
+            Enable-IfPresent   $adapter @('RSC (Receive Segment Coalescing)','Receive Segment Coalescing')
+            if ($adapter.InterfaceDescription -match 'I225') {
+                Disable-IfPresent $adapter @('Large Send Offload','Large Send Offload v2 (IPv4)','Large Send Offload v2 (IPv6)')
+                Disable-IfPresent $adapter @('RSC (Receive Segment Coalescing)','Receive Segment Coalescing')
+            }
+            Disable-IfPresent  $adapter @('Receive Side Coalescing','RSC (Receive Segment Coalescing)')
+            Enable-IfPresent   $adapter @('RSS','Receive Side Scaling')
+            Set-Buffers        $adapter 1024 1024
+            Enable-IfPresent   $adapter @('Large Send Offload v2 (IPv4)','Large Send Offload v2 (IPv6)','Large Send Offload','LSO')
+            Enable-IfPresent   $adapter @('TCP Checksum Offload (IPv4)','TCP Checksum Offload (IPv6)','TCP Checksum Offload','UDP Checksum Offload')
+        }
+        'KillerE3100G' {
+            Apply-AdapterProfile -Preset 'Intel2p5G' -NicName $NicName
+        }
+        'IntelI226' {
+            if ($adapter.InterfaceDescription -notmatch 'I226') { return $false }
+            Disable-IfPresent  $adapter @('Energy-Efficient Ethernet','Energy Efficient Ethernet','EEE')
+            Disable-IfPresent  $adapter @('Flow Control')
+            Set-InterruptModeration $adapter 'Low'
+            Disable-IfPresent  $adapter @('Receive Side Coalescing','RSC (Receive Segment Coalescing)')
+            Enable-IfPresent   $adapter @('RSS','Receive Side Scaling','Receive Side Scaling v2')
+            Set-Buffers        $adapter 1024 1024
+            Enable-IfPresent   $adapter @('Large Send Offload v2 (IPv4)','Large Send Offload v2 (IPv6)','Large Send Offload','LSO')
+            Enable-IfPresent   $adapter @('TCP Checksum Offload (IPv4)','TCP Checksum Offload (IPv6)','TCP Checksum Offload','UDP Checksum Offload')
+        }
+        'IntelI225' {
+            Set-InterruptModeration $adapter 'Low'
+            Enable-IfPresent   $adapter @('RSS','Receive Side Scaling')
+            Set-Buffers        $adapter 1024 1024
+        }
+        default { return $false }
+    }
+    return $true
+}
+
+function Get-MsiKeyPathFromPnp($pnpId) {
+    if ([string]::IsNullOrWhiteSpace($pnpId)) { return $null }
+    $base = "HKLM:\SYSTEM\CurrentControlSet\Enum\$pnpId\Device Parameters\Interrupt Management\MessageSignaledInterruptProperties"
+    return $base
+}
+
+function Get-Msisupported {
+    param([string]$MsiKeyPath)
+    try {
+        return (Get-ItemProperty -Path $MsiKeyPath -Name 'MSISupported' -ErrorAction Stop).MSISupported
+    } catch { return $null }
+}
+
+function Set-Msisupported {
+    param([string]$MsiKeyPath,[uint32]$Value)
+    if ($null -eq $MsiKeyPath) { return }
+    New-Item -Path $MsiKeyPath -Force | Out-Null
+    New-ItemProperty -Path $MsiKeyPath -Name 'MSISupported' -PropertyType DWord -Value $Value -Force | Out-Null
+}
+
+function Backup-MsiIfNeeded {
+    param([string]$NicName,[string]$MsiKeyPath)
+    Ensure-BackupKey
+    if ($null -eq $MsiKeyPath) { return }
+    $cur = Get-Msisupported -MsiKeyPath $MsiKeyPath
+    $bkName = ("MSI_{0}" -f $NicName).Replace(':','_').Replace(' ','_')
+    try {
+        [void](Get-ItemProperty -Path $PB_BackupKey -Name $bkName -ErrorAction Stop)
+    } catch {
+        if ($null -ne $cur) {
+            New-ItemProperty -Path $PB_BackupKey -Name $bkName -PropertyType DWord -Value $cur -Force | Out-Null
+        }
+    }
+}
+
+function Restore-MsiIfAny {
+    param([string]$NicName,[string]$MsiKeyPath)
+    $bkName = ("MSI_{0}" -f $NicName).Replace(':','_').Replace(' ','_')
+    try {
+        $bk = (Get-ItemProperty -Path $PB_BackupKey -Name $bkName -ErrorAction Stop).$bkName
+        Set-Msisupported -MsiKeyPath $MsiKeyPath -Value $bk
+    } catch {
+    }
+}
+
+function Apply-RSSPreset {
+    param([string]$NicName,[int]$BaseCore,[int]$MaxCore)
+    try {
+        Enable-NetAdapterRss -Name $NicName -ErrorAction SilentlyContinue | Out-Null
+        Set-NetAdapterRss -Name $NicName -BaseProcessorGroup 0 -BaseProcessorNumber $BaseCore -MaxProcessorNumber $MaxCore -ErrorAction Stop | Out-Null
+        return $true
+    } catch { return $false }
+}
+
+function Reset-RSSPreset {
+    param([string]$NicName)
+    try {
+        Disable-NetAdapterRss -Name $NicName -ErrorAction SilentlyContinue | Out-Null
+        Enable-NetAdapterRss  -Name $NicName -ErrorAction SilentlyContinue | Out-Null
+        return $true
+    } catch { return $false }
+}
+
+function Apply-IRQPreset {
+    param([string]$Preset,[string]$NicName,[string]$PnpId)
+    if ([string]::IsNullOrWhiteSpace($NicName)) { return $false }
+
+    $cores = [Environment]::ProcessorCount
+    $base  = if ($cores -ge 4) { 2 } elseif ($cores -ge 2) { 1 } else { 0 }
+    $max   = [Math]::Min($base+1, $cores-1)
+
+    $msiPath = Get-MsiKeyPathFromPnp $PnpId
+    Backup-MsiIfNeeded -NicName $NicName -MsiKeyPath $msiPath
+    if ($msiPath) { Set-Msisupported -MsiKeyPath $msiPath -Value 1 }
+
+    $profileOk = Apply-AdapterProfile -Preset $Preset -NicName $NicName
+    $rssOk = Apply-RSSPreset -NicName $NicName -BaseCore $base -MaxCore $max
+    return ($profileOk -or $rssOk)
+}
+
+function Revert-IRQPreset {
+    param([string]$NicName,[string]$PnpId)
+    $msiPath = Get-MsiKeyPathFromPnp $PnpId
+    $ok1 = Reset-RSSPreset -NicName $NicName
+    if ($msiPath) { Restore-MsiIfAny -NicName $NicName -MsiKeyPath $msiPath }
+    return $ok1
+}
+
+$Form                            = New-Object system.Windows.Forms.Form
+$Form.ClientSize                 = New-Object System.Drawing.Point(1900,1450)
+$Form.text                       = "Network  Adapter - Tweaker"
+$Form.TopMost                    = $false
+$Form.BackColor                  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+$Form.AutoScaleMode              = 'Dpi'
+
+$ColorPrimary      = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$ColorSurface      = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+$ColorQuickPreset  = [System.Drawing.ColorTranslator]::FromHtml("#1ec38b")
+$ColorQuickAction  = [System.Drawing.ColorTranslator]::FromHtml("#ffd166")
+$ColorSecurity     = [System.Drawing.ColorTranslator]::FromHtml("#ff8c42")
+$ColorActionText   = [System.Drawing.Color]::FromArgb(20,20,20)
+
+$cb_AdapterNamesCombo            = New-Object system.Windows.Forms.ComboBox
+$cb_AdapterNamesCombo.width      = 262
+$cb_AdapterNamesCombo.height     = 20
+$cb_AdapterNamesCombo.location   = New-Object System.Drawing.Point(64,16)
+$cb_AdapterNamesCombo.Font       = New-Object System.Drawing.Font('Calibri',9)
+$cb_AdapterNamesCombo.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_AdapterNamesCombo.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label1                          = New-Object system.Windows.Forms.Label
+$Label1.text                     = "Adapter:"
+$Label1.AutoSize                 = $true
+$Label1.width                    = 25
+$Label1.height                   = 10
+$Label1.location                 = New-Object System.Drawing.Point(10,20)
+$Label1.Font                     = New-Object System.Drawing.Font('Calibri',10)
+$Label1.ForeColor                = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$Label2                          = New-Object system.Windows.Forms.Label
+$Label2.text                     = "Registry:"
+$Label2.AutoSize                 = $true
+$Label2.width                    = 25
+$Label2.height                   = 10
+$Label2.location                 = New-Object System.Drawing.Point(10,43)
+$Label2.Font                     = New-Object System.Drawing.Font('Calibri',10)
+$Label2.ForeColor                = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$lbl_Path                        = New-Object system.Windows.Forms.Label
+$lbl_Path.AutoSize               = $true
+$lbl_Path.width                  = 25
+$lbl_Path.height                 = 10
+$lbl_Path.location               = New-Object System.Drawing.Point(63,45)
+$lbl_Path.Font                   = New-Object System.Drawing.Font('Calibri',9)
+$lbl_Path.ForeColor              = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$Label3                          = New-Object system.Windows.Forms.Label
+$Label3.text                     = "NDIS:"
+$Label3.AutoSize                 = $true
+$Label3.width                    = 25
+$Label3.height                   = 10
+$Label3.location                 = New-Object System.Drawing.Point(10,66)
+$Label3.Font                     = New-Object System.Drawing.Font('Calibri',10)
+$Label3.ForeColor                = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$lbl_ndisver                     = New-Object system.Windows.Forms.Label
+$lbl_ndisver.AutoSize            = $true
+$lbl_ndisver.width               = 25
+$lbl_ndisver.height              = 10
+$lbl_ndisver.location            = New-Object System.Drawing.Point(63,65)
+$lbl_ndisver.Font                = New-Object System.Drawing.Font('Calibri',10)
+$lbl_ndisver.ForeColor           = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$btn_RevertCenter = New-Object System.Windows.Forms.Button
+$btn_RevertCenter.Text       = "Revert Center..."
+$btn_RevertCenter.Width      = 120
+$btn_RevertCenter.Height     = 26
+$btn_RevertCenter.Location   = New-Object System.Drawing.Point(120,128)
+$btn_RevertCenter.Font       = New-Object System.Drawing.Font('Calibri',10)
+$btn_RevertCenter.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$btn_RevertCenter.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+$Groupbox10.Controls.Add($btn_RevertCenter)
+
+$Groupbox1                       = New-Object system.Windows.Forms.Groupbox
+$Groupbox1.height                = 213
+$Groupbox1.width                 = 233
+$Groupbox1.text                  = "RSS Settings"
+$Groupbox1.location              = New-Object System.Drawing.Point(10,93)
+
+$Label4                          = New-Object system.Windows.Forms.Label
+$Label4.text                     = "Profile:"
+$Label4.AutoSize                 = $true
+$Label4.width                    = 25
+$Label4.height                   = 10
+$Label4.location                 = New-Object System.Drawing.Point(8,66)
+$Label4.Font                     = New-Object System.Drawing.Font('Calibri',10)
+$Label4.ForeColor                = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$Label5                          = New-Object system.Windows.Forms.Label
+$Label5.text                     = "NumberOfReceiveQueues:"
+$Label5.AutoSize                 = $true
+$Label5.width                    = 25
+$Label5.height                   = 10
+$Label5.location                 = New-Object System.Drawing.Point(8,43)
+$Label5.Font                     = New-Object System.Drawing.Font('Calibri',10)
+$Label5.ForeColor                = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$Label6                          = New-Object system.Windows.Forms.Label
+$Label6.text                     = "Status:"
+$Label6.AutoSize                 = $true
+$Label6.width                    = 25
+$Label6.height                   = 10
+$Label6.location                 = New-Object System.Drawing.Point(8,20)
+$Label6.Font                     = New-Object System.Drawing.Font('Calibri',10)
+$Label6.ForeColor                = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$lbl_rssstatus                   = New-Object system.Windows.Forms.Label
+$lbl_rssstatus.AutoSize          = $true
+$lbl_rssstatus.width             = 25
+$lbl_rssstatus.height            = 10
+$lbl_rssstatus.location          = New-Object System.Drawing.Point(61,20)
+$lbl_rssstatus.Font              = New-Object System.Drawing.Font('Calibri',10)
+$lbl_rssstatus.ForeColor         = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_rss_onoff                    = New-Object system.Windows.Forms.ComboBox
+$cb_rss_onoff.width              = 108
+$cb_rss_onoff.height             = 20
+@('Enable','Disable') | ForEach-Object {[void] $cb_rss_onoff.Items.Add($_)}
+$cb_rss_onoff.location           = New-Object System.Drawing.Point(117,17)
+$cb_rss_onoff.Font               = New-Object System.Drawing.Font('Calibri',9)
+$cb_rss_onoff.ForeColor          = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_rss_onoff.BackColor          = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$btn_apply                       = New-Object system.Windows.Forms.Button
+$btn_apply.text                  = "Apply"
+$btn_apply.width                 = 60
+$btn_apply.height                = 21
+$btn_apply.location              = New-Object System.Drawing.Point(10,312)
+$btn_apply.Font                  = New-Object System.Drawing.Font('Calibri',10)
+$btn_apply.ForeColor             = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_rssqueues                    = New-Object system.Windows.Forms.ComboBox
+$cb_rssqueues.width              = 60
+$cb_rssqueues.height             = 20
+$cb_rssqueues.location           = New-Object System.Drawing.Point(165,41)
+$cb_rssqueues.Font               = New-Object System.Drawing.Font('Calibri',9)
+$cb_rssqueues.ForeColor          = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_rssqueues.BackColor          = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$btn_unqueues                    = New-Object system.Windows.Forms.Button
+$btn_unqueues.text               = "Unlock RSSQueues"
+$btn_unqueues.width              = 112
+$btn_unqueues.height             = 21
+$btn_unqueues.location           = New-Object System.Drawing.Point(76,312)
+$btn_unqueues.Font               = New-Object System.Drawing.Font('Calibri',9)
+$btn_unqueues.ForeColor          = [System.Drawing.ColorTranslator]::FromHtml("#f8e71c")
+
+$cb_rssprofile                   = New-Object system.Windows.Forms.ComboBox
+$cb_rssprofile.width             = 108
+$cb_rssprofile.height            = 20
+$cb_rssprofile.location          = New-Object System.Drawing.Point(117,66)
+$cb_rssprofile.Font              = New-Object System.Drawing.Font('Calibri',9)
+$cb_rssprofile.ForeColor         = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_rssprofile.BackColor         = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label7                          = New-Object system.Windows.Forms.Label
+$Label7.text                     = "BaseProcessor:"
+$Label7.AutoSize                 = $true
+$Label7.width                    = 25
+$Label7.height                   = 10
+$Label7.location                 = New-Object System.Drawing.Point(8,92)
+$Label7.Font                     = New-Object System.Drawing.Font('Calibri',10)
+$Label7.ForeColor                = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_rssbaseproc                  = New-Object system.Windows.Forms.ComboBox
+$cb_rssbaseproc.width            = 108
+$cb_rssbaseproc.height           = 20
+@('0','1','2','3','4','5','6','7','8','9','10','11','12','13','14','15') | ForEach-Object {[void] $cb_rssbaseproc.Items.Add($_)}
+$cb_rssbaseproc.location         = New-Object System.Drawing.Point(117,89)
+$cb_rssbaseproc.Font             = New-Object System.Drawing.Font('Calibri',9)
+$cb_rssbaseproc.ForeColor        = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_rssbaseproc.BackColor        = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label8                          = New-Object system.Windows.Forms.Label
+$Label8.text                     = "MaxProcessor:"
+$Label8.AutoSize                 = $true
+$Label8.width                    = 25
+$Label8.height                   = 10
+$Label8.location                 = New-Object System.Drawing.Point(7,115)
+$Label8.Font                     = New-Object System.Drawing.Font('Calibri',10)
+$Label8.ForeColor                = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_rssmaxproc                   = New-Object system.Windows.Forms.ComboBox
+$cb_rssmaxproc.width             = 108
+$cb_rssmaxproc.height            = 20
+@('0','1','2','3','4','5','6','7','8','9','10','11','12','13','14','15') | ForEach-Object {[void] $cb_rssmaxproc.Items.Add($_)}
+$cb_rssmaxproc.location          = New-Object System.Drawing.Point(117,112)
+$cb_rssmaxproc.Font              = New-Object System.Drawing.Font('Calibri',9)
+$cb_rssmaxproc.ForeColor         = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_rssmaxproc.BackColor         = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label9                          = New-Object system.Windows.Forms.Label
+$Label9.text                     = "MaxProcessors:"
+$Label9.AutoSize                 = $true
+$Label9.width                    = 25
+$Label9.height                   = 10
+$Label9.location                 = New-Object System.Drawing.Point(7,139)
+$Label9.Font                     = New-Object System.Drawing.Font('Calibri',10)
+$Label9.ForeColor                = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_rssmaxprocs                  = New-Object system.Windows.Forms.ComboBox
+$cb_rssmaxprocs.width            = 108
+$cb_rssmaxprocs.height           = 20
+@('0','1','2','3','4','5','6','7','8','9','10','11','12','13','14','15') | ForEach-Object {[void] $cb_rssmaxprocs.Items.Add($_)}
+$cb_rssmaxprocs.location         = New-Object System.Drawing.Point(117,136)
+$cb_rssmaxprocs.Font             = New-Object System.Drawing.Font('Calibri',9)
+$cb_rssmaxprocs.ForeColor        = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_rssmaxprocs.BackColor        = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$btn_openreg                     = New-Object system.Windows.Forms.Button
+$btn_openreg.text                = "Open"
+$btn_openreg.width               = 86
+$btn_openreg.height              = 20
+$btn_openreg.location            = New-Object System.Drawing.Point(334,16)
+$btn_openreg.Font                = New-Object System.Drawing.Font('Calibri',10)
+$btn_openreg.ForeColor           = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$Groupbox2                       = New-Object system.Windows.Forms.Groupbox
+$Groupbox2.height                = 190
+$Groupbox2.width                 = 311
+$Groupbox2.text                  = "Global Settings"
+$Groupbox2.location              = New-Object System.Drawing.Point(250,93)
+
+$Label10                         = New-Object system.Windows.Forms.Label
+$Label10.text                    = "ReceiveSideScaling:"
+$Label10.AutoSize                = $true
+$Label10.width                   = 25
+$Label10.height                  = 10
+$Label10.location                = New-Object System.Drawing.Point(10,20)
+$Label10.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label10.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_osrss                        = New-Object system.Windows.Forms.ComboBox
+$cb_osrss.width                  = 108
+$cb_osrss.height                 = 20
+@('Enabled','Disabled') | ForEach-Object {[void] $cb_osrss.Items.Add($_)}
+$cb_osrss.location               = New-Object System.Drawing.Point(194,17)
+$cb_osrss.Font                   = New-Object System.Drawing.Font('Calibri',9)
+$cb_osrss.ForeColor              = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_osrss.BackColor              = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label11                         = New-Object system.Windows.Forms.Label
+$Label11.text                    = "ReceiveSegmentCoalescing:"
+$Label11.AutoSize                = $true
+$Label11.width                   = 148
+$Label11.height                  = 10
+$Label11.location                = New-Object System.Drawing.Point(10,44)
+$Label11.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label11.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_osrsc                        = New-Object system.Windows.Forms.ComboBox
+$cb_osrsc.width                  = 108
+$cb_osrsc.height                 = 20
+@('Enabled','Disabled') | ForEach-Object {[void] $cb_osrsc.Items.Add($_)}
+$cb_osrsc.location               = New-Object System.Drawing.Point(194,40)
+$cb_osrsc.Font                   = New-Object System.Drawing.Font('Calibri',9)
+$cb_osrsc.ForeColor              = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_osrsc.BackColor              = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label12                         = New-Object system.Windows.Forms.Label
+$Label12.text                    = "Chimney:"
+$Label12.AutoSize                = $true
+$Label12.width                   = 25
+$Label12.height                  = 10
+$Label12.location                = New-Object System.Drawing.Point(11,68)
+$Label12.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label12.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_oschimney                    = New-Object system.Windows.Forms.ComboBox
+$cb_oschimney.width              = 108
+$cb_oschimney.height             = 20
+@('Enabled','Disabled') | ForEach-Object {[void] $cb_oschimney.Items.Add($_)}
+$cb_oschimney.location           = New-Object System.Drawing.Point(194,63)
+$cb_oschimney.Font               = New-Object System.Drawing.Font('Calibri',9)
+$cb_oschimney.ForeColor          = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_oschimney.BackColor          = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label13                         = New-Object system.Windows.Forms.Label
+$Label13.text                    = "TaskOffload:"
+$Label13.AutoSize                = $true
+$Label13.width                   = 25
+$Label13.height                  = 10
+$Label13.location                = New-Object System.Drawing.Point(10,91)
+$Label13.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label13.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_ostaskoff                    = New-Object system.Windows.Forms.ComboBox
+$cb_ostaskoff.width              = 108
+$cb_ostaskoff.height             = 20
+@('Enabled','Disabled') | ForEach-Object {[void] $cb_ostaskoff.Items.Add($_)}
+$cb_ostaskoff.location           = New-Object System.Drawing.Point(194,86)
+$cb_ostaskoff.Font               = New-Object System.Drawing.Font('Calibri',9)
+$cb_ostaskoff.ForeColor          = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_ostaskoff.BackColor          = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$cb_osntd                        = New-Object system.Windows.Forms.ComboBox
+$cb_osntd.width                  = 108
+$cb_osntd.height                 = 20
+@('Enabled','Disabled') | ForEach-Object {[void] $cb_osntd.Items.Add($_)}
+$cb_osntd.location               = New-Object System.Drawing.Point(194,109)
+$cb_osntd.Font                   = New-Object System.Drawing.Font('Calibri',9)
+$cb_osntd.ForeColor              = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_osntd.BackColor              = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label14                         = New-Object system.Windows.Forms.Label
+$Label14.text                    = "NetworkDirect:"
+$Label14.AutoSize                = $true
+$Label14.width                   = 25
+$Label14.height                  = 10
+$Label14.location                = New-Object System.Drawing.Point(10,114)
+$Label14.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label14.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_osntdais                     = New-Object system.Windows.Forms.ComboBox
+$cb_osntdais.width               = 108
+$cb_osntdais.height              = 20
+@('Blocked','Allowed') | ForEach-Object {[void] $cb_osntdais.Items.Add($_)}
+$cb_osntdais.location            = New-Object System.Drawing.Point(194,132)
+$cb_osntdais.Font                = New-Object System.Drawing.Font('Calibri',9)
+$cb_osntdais.ForeColor           = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_osntdais.BackColor           = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label15                         = New-Object system.Windows.Forms.Label
+$Label15.text                    = "NetworkDirectAcrossIPSubnets:"
+$Label15.AutoSize                = $true
+$Label15.width                   = 25
+$Label15.height                  = 10
+$Label15.location                = New-Object System.Drawing.Point(10,137)
+$Label15.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label15.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_ospcf                        = New-Object system.Windows.Forms.ComboBox
+$cb_ospcf.width                  = 108
+$cb_ospcf.height                 = 20
+@('Enabled','Disabled') | ForEach-Object {[void] $cb_ospcf.Items.Add($_)}
+$cb_ospcf.location               = New-Object System.Drawing.Point(194,156)
+$cb_ospcf.Font                   = New-Object System.Drawing.Font('Calibri',9)
+$cb_ospcf.ForeColor              = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_ospcf.BackColor              = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label16                         = New-Object system.Windows.Forms.Label
+$Label16.text                    = "PacketCoalescingFilter:"
+$Label16.AutoSize                = $true
+$Label16.width                   = 25
+$Label16.height                  = 10
+$Label16.location                = New-Object System.Drawing.Point(10,161)
+$Label16.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label16.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$btn_applyglobal                 = New-Object system.Windows.Forms.Button
+$btn_applyglobal.text            = "Apply"
+$btn_applyglobal.width           = 60
+$btn_applyglobal.height          = 21
+$btn_applyglobal.location        = New-Object System.Drawing.Point(251,286)
+$btn_applyglobal.Font            = New-Object System.Drawing.Font('Calibri',10)
+$btn_applyglobal.ForeColor       = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$Groupbox3                       = New-Object system.Windows.Forms.Groupbox
+$Groupbox3.height                = 584
+$Groupbox3.width                 = 399
+$Groupbox3.text                  = "Adv. Adapter"
+$Groupbox3.location              = New-Object System.Drawing.Point(570,93)
+
+$Label17                         = New-Object system.Windows.Forms.Label
+$Label17.text                    = "FlowControl:"
+$Label17.AutoSize                = $true
+$Label17.width                   = 25
+$Label17.height                  = 10
+$Label17.location                = New-Object System.Drawing.Point(9,20)
+$Label17.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label17.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_flowcontrol                  = New-Object system.Windows.Forms.ComboBox
+$cb_flowcontrol.width            = 190
+$cb_flowcontrol.height           = 20
+@('0 - Disabled','1 - Tx Enabled','2 - Rx Enabled','3 - Rx and Tx Enabled') | ForEach-Object {[void] $cb_flowcontrol.Items.Add($_)}
+$cb_flowcontrol.location         = New-Object System.Drawing.Point(193,17)
+$cb_flowcontrol.Font             = New-Object System.Drawing.Font('Calibri',9)
+$cb_flowcontrol.ForeColor        = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_flowcontrol.BackColor        = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label18                         = New-Object system.Windows.Forms.Label
+$Label18.text                    = "IPChecksumOffloadIPv4:"
+$Label18.AutoSize                = $true
+$Label18.width                   = 25
+$Label18.height                  = 10
+$Label18.location                = New-Object System.Drawing.Point(9,42)
+$Label18.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label18.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$Label19                         = New-Object system.Windows.Forms.Label
+$Label19.text                    = "TCPChecksumOffloadIPv4:"
+$Label19.AutoSize                = $true
+$Label19.width                   = 25
+$Label19.height                  = 10
+$Label19.location                = New-Object System.Drawing.Point(9,64)
+$Label19.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label19.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$Label20                         = New-Object system.Windows.Forms.Label
+$Label20.text                    = "TCPChecksumOffloadIPv6:"
+$Label20.AutoSize                = $true
+$Label20.width                   = 25
+$Label20.height                  = 10
+$Label20.location                = New-Object System.Drawing.Point(9,86)
+$Label20.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label20.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$Label21                         = New-Object system.Windows.Forms.Label
+$Label21.text                    = "UDPChecksumOffloadIPv4:"
+$Label21.AutoSize                = $true
+$Label21.width                   = 25
+$Label21.height                  = 10
+$Label21.location                = New-Object System.Drawing.Point(9,108)
+$Label21.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label21.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$Label22                         = New-Object system.Windows.Forms.Label
+$Label22.text                    = "UDPChecksumOffloadIPv6:"
+$Label22.AutoSize                = $true
+$Label22.width                   = 25
+$Label22.height                  = 10
+$Label22.location                = New-Object System.Drawing.Point(9,130)
+$Label22.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label22.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$Label23                         = New-Object system.Windows.Forms.Label
+$Label23.text                    = "InterruptModeration:"
+$Label23.AutoSize                = $true
+$Label23.width                   = 25
+$Label23.height                  = 10
+$Label23.location                = New-Object System.Drawing.Point(9,324)
+$Label23.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label23.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_InterruptModeration          = New-Object system.Windows.Forms.ComboBox
+$cb_InterruptModeration.width    = 190
+$cb_InterruptModeration.height   = 20
+@('0 - Disabled','1 - Enabled') | ForEach-Object {[void] $cb_InterruptModeration.Items.Add($_)}
+$cb_InterruptModeration.location  = New-Object System.Drawing.Point(193,321)
+$cb_InterruptModeration.Font     = New-Object System.Drawing.Font('Calibri',9)
+$cb_InterruptModeration.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_InterruptModeration.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$btn_applyadv                    = New-Object system.Windows.Forms.Button
+$btn_applyadv.text               = "Apply"
+$btn_applyadv.width              = 60
+$btn_applyadv.height             = 21
+$btn_applyadv.location           = New-Object System.Drawing.Point(570,682)
+$btn_applyadv.Font               = New-Object System.Drawing.Font('Calibri',10)
+$btn_applyadv.ForeColor          = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$btn_adaptrest                   = New-Object system.Windows.Forms.Button
+$btn_adaptrest.text              = "Restart Adapter"
+$btn_adaptrest.width             = 112
+$btn_adaptrest.height            = 20
+$btn_adaptrest.location          = New-Object System.Drawing.Point(511,16)
+$btn_adaptrest.Font              = New-Object System.Drawing.Font('Calibri',10)
+$btn_adaptrest.ForeColor         = [System.Drawing.ColorTranslator]::FromHtml("#d0021b")
+
+$cb_IPChecksumOffloadIPv4        = New-Object system.Windows.Forms.ComboBox
+$cb_IPChecksumOffloadIPv4.width  = 190
+$cb_IPChecksumOffloadIPv4.height  = 20
+@('0 - Disabled','1 - Tx Enabled','2 - Rx Enabled','3 - Rx and Tx Enabled') | ForEach-Object {[void] $cb_IPChecksumOffloadIPv4.Items.Add($_)}
+$cb_IPChecksumOffloadIPv4.location  = New-Object System.Drawing.Point(193,39)
+$cb_IPChecksumOffloadIPv4.Font   = New-Object System.Drawing.Font('Calibri',9)
+$cb_IPChecksumOffloadIPv4.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_IPChecksumOffloadIPv4.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$cb_TCPChecksumOffloadIPv4       = New-Object system.Windows.Forms.ComboBox
+$cb_TCPChecksumOffloadIPv4.width  = 190
+$cb_TCPChecksumOffloadIPv4.height  = 20
+@('0 - Disabled','1 - Tx Enabled','2 - Rx Enabled','3 - Rx and Tx Enabled') | ForEach-Object {[void] $cb_TCPChecksumOffloadIPv4.Items.Add($_)}
+$cb_TCPChecksumOffloadIPv4.location  = New-Object System.Drawing.Point(193,61)
+$cb_TCPChecksumOffloadIPv4.Font  = New-Object System.Drawing.Font('Calibri',9)
+$cb_TCPChecksumOffloadIPv4.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_TCPChecksumOffloadIPv4.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$cb_TCPChecksumOffloadIPv6       = New-Object system.Windows.Forms.ComboBox
+$cb_TCPChecksumOffloadIPv6.width  = 190
+$cb_TCPChecksumOffloadIPv6.height  = 20
+@('0 - Disabled','1 - Tx Enabled','2 - Rx Enabled','3 - Rx and Tx Enabled') | ForEach-Object {[void] $cb_TCPChecksumOffloadIPv6.Items.Add($_)}
+$cb_TCPChecksumOffloadIPv6.location  = New-Object System.Drawing.Point(193,83)
+$cb_TCPChecksumOffloadIPv6.Font  = New-Object System.Drawing.Font('Calibri',9)
+$cb_TCPChecksumOffloadIPv6.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_TCPChecksumOffloadIPv6.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$cb_UDPChecksumOffloadIPv4       = New-Object system.Windows.Forms.ComboBox
+$cb_UDPChecksumOffloadIPv4.width  = 190
+$cb_UDPChecksumOffloadIPv4.height  = 20
+@('0 - Disabled','1 - Tx Enabled','2 - Rx Enabled','3 - Rx and Tx Enabled') | ForEach-Object {[void] $cb_UDPChecksumOffloadIPv4.Items.Add($_)}
+$cb_UDPChecksumOffloadIPv4.location  = New-Object System.Drawing.Point(193,105)
+$cb_UDPChecksumOffloadIPv4.Font  = New-Object System.Drawing.Font('Calibri',9)
+$cb_UDPChecksumOffloadIPv4.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_UDPChecksumOffloadIPv4.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$cb_UDPChecksumOffloadIPv6       = New-Object system.Windows.Forms.ComboBox
+$cb_UDPChecksumOffloadIPv6.width  = 190
+$cb_UDPChecksumOffloadIPv6.height  = 20
+@('0 - Disabled','1 - Tx Enabled','2 - Rx Enabled','3 - Rx and Tx Enabled') | ForEach-Object {[void] $cb_UDPChecksumOffloadIPv6.Items.Add($_)}
+$cb_UDPChecksumOffloadIPv6.location  = New-Object System.Drawing.Point(193,127)
+$cb_UDPChecksumOffloadIPv6.Font  = New-Object System.Drawing.Font('Calibri',9)
+$cb_UDPChecksumOffloadIPv6.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_UDPChecksumOffloadIPv6.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label24                         = New-Object system.Windows.Forms.Label
+$Label24.text                    = "InterruptModerationRate:"
+$Label24.AutoSize                = $true
+$Label24.width                   = 25
+$Label24.height                  = 10
+$Label24.location                = New-Object System.Drawing.Point(9,346)
+$Label24.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label24.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_InterruptModerationRate      = New-Object system.Windows.Forms.ComboBox
+$cb_InterruptModerationRate.width  = 190
+$cb_InterruptModerationRate.height  = 20
+@('0 - Disabled','200 - Minimal','400 - Low','950 - Medium','2000 - High','3600 - Extreme','65535 - Adaptive') | ForEach-Object {[void] $cb_InterruptModerationRate.Items.Add($_)}
+$cb_InterruptModerationRate.location  = New-Object System.Drawing.Point(193,343)
+$cb_InterruptModerationRate.Font  = New-Object System.Drawing.Font('Calibri',9)
+$cb_InterruptModerationRate.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_InterruptModerationRate.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label25                         = New-Object system.Windows.Forms.Label
+$Label25.text                    = "LsoV2IPv4"
+$Label25.AutoSize                = $true
+$Label25.width                   = 25
+$Label25.height                  = 10
+$Label25.location                = New-Object System.Drawing.Point(9,174)
+$Label25.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label25.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$Label26                         = New-Object system.Windows.Forms.Label
+$Label26.text                    = "LsoV2IPv6"
+$Label26.AutoSize                = $true
+$Label26.width                   = 25
+$Label26.height                  = 10
+$Label26.location                = New-Object System.Drawing.Point(9,196)
+$Label26.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label26.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_LsoV2IPv4                    = New-Object system.Windows.Forms.ComboBox
+$cb_LsoV2IPv4.width              = 190
+$cb_LsoV2IPv4.height             = 20
+@('0 - Disabled','1 - Enabled') | ForEach-Object {[void] $cb_LsoV2IPv4.Items.Add($_)}
+$cb_LsoV2IPv4.location           = New-Object System.Drawing.Point(193,171)
+$cb_LsoV2IPv4.Font               = New-Object System.Drawing.Font('Calibri',9)
+$cb_LsoV2IPv4.ForeColor          = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_LsoV2IPv4.BackColor          = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$cb_LsoV2IPv6                    = New-Object system.Windows.Forms.ComboBox
+$cb_LsoV2IPv6.width              = 190
+$cb_LsoV2IPv6.height             = 20
+@('0 - Disabled','1 - Enabled') | ForEach-Object {[void] $cb_LsoV2IPv6.Items.Add($_)}
+$cb_LsoV2IPv6.location           = New-Object System.Drawing.Point(193,193)
+$cb_LsoV2IPv6.Font               = New-Object System.Drawing.Font('Calibri',9)
+$cb_LsoV2IPv6.ForeColor          = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_LsoV2IPv6.BackColor          = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label27                         = New-Object system.Windows.Forms.Label
+$Label27.text                    = "LsoV1IPv4"
+$Label27.AutoSize                = $true
+$Label27.width                   = 25
+$Label27.height                  = 10
+$Label27.location                = New-Object System.Drawing.Point(9,152)
+$Label27.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label27.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_LsoV1IPv4                    = New-Object system.Windows.Forms.ComboBox
+$cb_LsoV1IPv4.width              = 190
+$cb_LsoV1IPv4.height             = 20
+@('0 - Disabled','1 - Enabled') | ForEach-Object {[void] $cb_LsoV1IPv4.Items.Add($_)}
+$cb_LsoV1IPv4.location           = New-Object System.Drawing.Point(193,149)
+$cb_LsoV1IPv4.Font               = New-Object System.Drawing.Font('Calibri',9)
+$cb_LsoV1IPv4.ForeColor          = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_LsoV1IPv4.BackColor          = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label28                         = New-Object system.Windows.Forms.Label
+$Label28.text                    = "PMNSOffload"
+$Label28.AutoSize                = $true
+$Label28.width                   = 25
+$Label28.height                  = 10
+$Label28.location                = New-Object System.Drawing.Point(9,238)
+$Label28.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label28.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_PMNSOffload                  = New-Object system.Windows.Forms.ComboBox
+$cb_PMNSOffload.width            = 190
+$cb_PMNSOffload.height           = 20
+@('0 - Disabled','1 - Enabled') | ForEach-Object {[void] $cb_PMNSOffload.Items.Add($_)}
+$cb_PMNSOffload.location         = New-Object System.Drawing.Point(193,235)
+$cb_PMNSOffload.Font             = New-Object System.Drawing.Font('Calibri',9)
+$cb_PMNSOffload.ForeColor        = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_PMNSOffload.BackColor        = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label29                         = New-Object system.Windows.Forms.Label
+$Label29.text                    = "PMARPOffload"
+$Label29.AutoSize                = $true
+$Label29.width                   = 25
+$Label29.height                  = 10
+$Label29.location                = New-Object System.Drawing.Point(9,216)
+$Label29.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label29.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_PMARPOffload                 = New-Object system.Windows.Forms.ComboBox
+$cb_PMARPOffload.width           = 190
+$cb_PMARPOffload.height          = 20
+@('0 - Disabled','1 - Enabled') | ForEach-Object {[void] $cb_PMARPOffload.Items.Add($_)}
+$cb_PMARPOffload.location        = New-Object System.Drawing.Point(193,213)
+$cb_PMARPOffload.Font            = New-Object System.Drawing.Font('Calibri',9)
+$cb_PMARPOffload.ForeColor       = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_PMARPOffload.BackColor       = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$cb_PriorityVLANTag              = New-Object system.Windows.Forms.ComboBox
+$cb_PriorityVLANTag.width        = 190
+$cb_PriorityVLANTag.height       = 20
+@('0 - Paketpriorität and VLAN disabled','1 - Paketpriorität enabled','2 - VLAN enabled','3 - Paketpriorität and VLAN enabled') | ForEach-Object {[void] $cb_PriorityVLANTag.Items.Add($_)}
+$cb_PriorityVLANTag.location     = New-Object System.Drawing.Point(193,256)
+$cb_PriorityVLANTag.Font         = New-Object System.Drawing.Font('Calibri',9)
+$cb_PriorityVLANTag.ForeColor    = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_PriorityVLANTag.BackColor    = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label00                         = New-Object system.Windows.Forms.Label
+$Label00.text                    = "PriorityVLANTag"
+$Label00.AutoSize                = $true
+$Label00.width                   = 25
+$Label00.height                  = 10
+$Label00.location                = New-Object System.Drawing.Point(9,259)
+$Label00.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label00.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$Label30                         = New-Object system.Windows.Forms.Label
+$Label30.text                    = "ReceiveBuffers"
+$Label30.AutoSize                = $true
+$Label30.width                   = 25
+$Label30.height                  = 10
+$Label30.location                = New-Object System.Drawing.Point(9,281)
+$Label30.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label30.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_ReceiveBuffers               = New-Object system.Windows.Forms.ComboBox
+$cb_ReceiveBuffers.width         = 190
+$cb_ReceiveBuffers.height        = 20
+$cb_ReceiveBuffers.location      = New-Object System.Drawing.Point(193,278)
+$cb_ReceiveBuffers.Font          = New-Object System.Drawing.Font('Calibri',9)
+$cb_ReceiveBuffers.ForeColor     = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_ReceiveBuffers.BackColor     = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label31                         = New-Object system.Windows.Forms.Label
+$Label31.text                    = "TransmitBuffers"
+$Label31.AutoSize                = $true
+$Label31.width                   = 25
+$Label31.height                  = 10
+$Label31.location                = New-Object System.Drawing.Point(9,303)
+$Label31.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label31.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_TransmitBuffers              = New-Object system.Windows.Forms.ComboBox
+$cb_TransmitBuffers.width        = 190
+$cb_TransmitBuffers.height       = 20
+$cb_TransmitBuffers.location     = New-Object System.Drawing.Point(193,300)
+$cb_TransmitBuffers.Font         = New-Object System.Drawing.Font('Calibri',9)
+$cb_TransmitBuffers.ForeColor    = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_TransmitBuffers.BackColor    = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Groupbox5                       = New-Object system.Windows.Forms.Groupbox
+$Groupbox5.height                = 66
+$Groupbox5.width                 = 230
+$Groupbox5.text                  = "RSS Global"
+$Groupbox5.location              = New-Object System.Drawing.Point(10,369)
+
+$Label32                         = New-Object system.Windows.Forms.Label
+$Label32.text                    = "TCP/IP_RssBaseCpu:"
+$Label32.AutoSize                = $true
+$Label32.width                   = 25
+$Label32.height                  = 10
+$Label32.location                = New-Object System.Drawing.Point(7,16)
+$Label32.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label32.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$Label33                         = New-Object system.Windows.Forms.Label
+$Label33.text                    = "NDIS_RssBaseCpu:"
+$Label33.AutoSize                = $true
+$Label33.width                   = 25
+$Label33.height                  = 10
+$Label33.location                = New-Object System.Drawing.Point(7,40)
+$Label33.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label33.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_tcpiprssbasecpu              = New-Object system.Windows.Forms.TextBox
+$cb_tcpiprssbasecpu.multiline    = $false
+$cb_tcpiprssbasecpu.width        = 89
+$cb_tcpiprssbasecpu.height       = 20
+$cb_tcpiprssbasecpu.location     = New-Object System.Drawing.Point(133,14)
+$cb_tcpiprssbasecpu.Font         = New-Object System.Drawing.Font('Calibri',10)
+$cb_tcpiprssbasecpu.ForeColor    = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_tcpiprssbasecpu.BackColor    = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$cb_ndisrssbasecpu               = New-Object system.Windows.Forms.TextBox
+$cb_ndisrssbasecpu.multiline     = $false
+$cb_ndisrssbasecpu.width         = 89
+$cb_ndisrssbasecpu.height        = 20
+$cb_ndisrssbasecpu.location      = New-Object System.Drawing.Point(133,38)
+$cb_ndisrssbasecpu.Font          = New-Object System.Drawing.Font('Calibri',10)
+$cb_ndisrssbasecpu.ForeColor     = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_ndisrssbasecpu.BackColor     = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Groupbox4                       = New-Object system.Windows.Forms.Groupbox
+$Groupbox4.height                = 265
+$Groupbox4.width                 = 321
+$Groupbox4.text                  = "PowerSaving Settings"
+$Groupbox4.location              = New-Object System.Drawing.Point(570,715)
+
+$Label34                         = New-Object system.Windows.Forms.Label
+$Label34.text                    = "(APM) sleep states:"
+$Label34.AutoSize                = $true
+$Label34.width                   = 25
+$Label34.height                  = 10
+$Label34.location                = New-Object System.Drawing.Point(8,18)
+$Label34.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label34.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_EnablePME                    = New-Object system.Windows.Forms.ComboBox
+$cb_EnablePME.width              = 108
+$cb_EnablePME.height             = 20
+@('Disabled','Enabled') | ForEach-Object {[void] $cb_EnablePME.Items.Add($_)}
+$cb_EnablePME.location           = New-Object System.Drawing.Point(204,15)
+$cb_EnablePME.Font               = New-Object System.Drawing.Font('Calibri',9)
+$cb_EnablePME.ForeColor          = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_EnablePME.BackColor          = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$btn_applypowersettings          = New-Object system.Windows.Forms.Button
+$btn_applypowersettings.text     = "Apply"
+$btn_applypowersettings.width    = 60
+$btn_applypowersettings.height   = 21
+$btn_applypowersettings.location  = New-Object System.Drawing.Point(570,893)
+$btn_applypowersettings.Font     = New-Object System.Drawing.Font('Calibri',10)
+$btn_applypowersettings.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$Label36                         = New-Object system.Windows.Forms.Label
+$Label36.text                    = "DynamicPowerGating:"
+$Label36.AutoSize                = $true
+$Label36.width                   = 25
+$Label36.height                  = 10
+$Label36.location                = New-Object System.Drawing.Point(8,40)
+$Label36.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label36.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_EnableDynamicPowerGating     = New-Object system.Windows.Forms.ComboBox
+$cb_EnableDynamicPowerGating.width  = 108
+$cb_EnableDynamicPowerGating.height  = 20
+@('Disabled','Enabled') | ForEach-Object {[void] $cb_EnableDynamicPowerGating.Items.Add($_)}
+$cb_EnableDynamicPowerGating.location  = New-Object System.Drawing.Point(204,37)
+$cb_EnableDynamicPowerGating.Font  = New-Object System.Drawing.Font('Calibri',9)
+$cb_EnableDynamicPowerGating.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_EnableDynamicPowerGating.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label37                         = New-Object system.Windows.Forms.Label
+$Label37.text                    = "ConnectedPowerGating:"
+$Label37.AutoSize                = $true
+$Label37.width                   = 25
+$Label37.height                  = 10
+$Label37.location                = New-Object System.Drawing.Point(8,62)
+$Label37.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label37.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_EnableConnectedPowerGating   = New-Object system.Windows.Forms.ComboBox
+$cb_EnableConnectedPowerGating.width  = 108
+$cb_EnableConnectedPowerGating.height  = 20
+@('Disabled','Enabled') | ForEach-Object {[void] $cb_EnableConnectedPowerGating.Items.Add($_)}
+$cb_EnableConnectedPowerGating.location  = New-Object System.Drawing.Point(204,59)
+$cb_EnableConnectedPowerGating.Font  = New-Object System.Drawing.Font('Calibri',9)
+$cb_EnableConnectedPowerGating.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_EnableConnectedPowerGating.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label38                         = New-Object system.Windows.Forms.Label
+$Label38.text                    = "AutoPowerSaveMode:"
+$Label38.AutoSize                = $true
+$Label38.width                   = 25
+$Label38.height                  = 10
+$Label38.location                = New-Object System.Drawing.Point(8,84)
+$Label38.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label38.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_AutoPowerSaveModeEnabled     = New-Object system.Windows.Forms.ComboBox
+$cb_AutoPowerSaveModeEnabled.width  = 108
+$cb_AutoPowerSaveModeEnabled.height  = 20
+@('Disabled','Enabled') | ForEach-Object {[void] $cb_AutoPowerSaveModeEnabled.Items.Add($_)}
+$cb_AutoPowerSaveModeEnabled.location  = New-Object System.Drawing.Point(204,81)
+$cb_AutoPowerSaveModeEnabled.Font  = New-Object System.Drawing.Font('Calibri',9)
+$cb_AutoPowerSaveModeEnabled.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_AutoPowerSaveModeEnabled.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$cb_NicAutoPowerSaver            = New-Object system.Windows.Forms.ComboBox
+$cb_NicAutoPowerSaver.width      = 108
+$cb_NicAutoPowerSaver.height     = 20
+@('Disabled','Enabled') | ForEach-Object {[void] $cb_NicAutoPowerSaver.Items.Add($_)}
+$cb_NicAutoPowerSaver.location   = New-Object System.Drawing.Point(204,103)
+$cb_NicAutoPowerSaver.Font       = New-Object System.Drawing.Font('Calibri',9)
+$cb_NicAutoPowerSaver.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_NicAutoPowerSaver.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label39                         = New-Object system.Windows.Forms.Label
+$Label39.text                    = "NicAutoPowerSaver:"
+$Label39.AutoSize                = $true
+$Label39.width                   = 25
+$Label39.height                  = 10
+$Label39.location                = New-Object System.Drawing.Point(9,106)
+$Label39.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label39.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$Label40                         = New-Object system.Windows.Forms.Label
+$Label40.text                    = "DelayedPowerUp:"
+$Label40.AutoSize                = $true
+$Label40.width                   = 25
+$Label40.height                  = 10
+$Label40.location                = New-Object System.Drawing.Point(9,128)
+$Label40.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label40.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_DisableDelayedPowerUp        = New-Object system.Windows.Forms.ComboBox
+$cb_DisableDelayedPowerUp.width  = 108
+$cb_DisableDelayedPowerUp.height  = 20
+@('Enabled','Disabled') | ForEach-Object {[void] $cb_DisableDelayedPowerUp.Items.Add($_)}
+$cb_DisableDelayedPowerUp.location  = New-Object System.Drawing.Point(204,125)
+$cb_DisableDelayedPowerUp.Font   = New-Object System.Drawing.Font('Calibri',9)
+$cb_DisableDelayedPowerUp.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_DisableDelayedPowerUp.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label41                         = New-Object system.Windows.Forms.Label
+$Label41.text                    = "ReduceSpeedOnPowerDown:"
+$Label41.AutoSize                = $true
+$Label41.width                   = 25
+$Label41.height                  = 10
+$Label41.location                = New-Object System.Drawing.Point(9,150)
+$Label41.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label41.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_ReduceSpeedOnPowerDown       = New-Object system.Windows.Forms.ComboBox
+$cb_ReduceSpeedOnPowerDown.width  = 108
+$cb_ReduceSpeedOnPowerDown.height  = 20
+@('Disabled','Enabled') | ForEach-Object {[void] $cb_ReduceSpeedOnPowerDown.Items.Add($_)}
+$cb_ReduceSpeedOnPowerDown.location  = New-Object System.Drawing.Point(204,147)
+$cb_ReduceSpeedOnPowerDown.Font  = New-Object System.Drawing.Font('Calibri',9)
+$cb_ReduceSpeedOnPowerDown.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_ReduceSpeedOnPowerDown.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label_pss                        = New-Object system.Windows.Forms.Label
+$Label_pss.text                   = "SelectiveSuspend (Global):"
+$Label_pss.AutoSize               = $true
+$Label_pss.width                  = 25
+$Label_pss.height                 = 10
+$Label_pss.location               = New-Object System.Drawing.Point(9,172)
+$Label_pss.Font                   = New-Object System.Drawing.Font('Calibri',10)
+$Label_pss.ForeColor              = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_DefaultSelectiveSuspend       = New-Object system.Windows.Forms.ComboBox
+$cb_DefaultSelectiveSuspend.width  = 108
+$cb_DefaultSelectiveSuspend.height  = 20
+@('Disabled','Enabled','Skip') | ForEach-Object {[void] $cb_DefaultSelectiveSuspend.Items.Add($_)}
+$cb_DefaultSelectiveSuspend.location  = New-Object System.Drawing.Point(204,169)
+$cb_DefaultSelectiveSuspend.Font  = New-Object System.Drawing.Font('Calibri',9)
+$cb_DefaultSelectiveSuspend.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_DefaultSelectiveSuspend.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+$cb_DefaultSelectiveSuspend.Text   = 'Skip'
+
+$Label_aspm                       = New-Object system.Windows.Forms.Label
+$Label_aspm.text                  = "PCIe ASPM (L1):"
+$Label_aspm.AutoSize              = $true
+$Label_aspm.width                 = 25
+$Label_aspm.height                = 10
+$Label_aspm.location              = New-Object System.Drawing.Point(9,194)
+$Label_aspm.Font                  = New-Object System.Drawing.Font('Calibri',10)
+$Label_aspm.ForeColor             = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_PcieAspm                     = New-Object system.Windows.Forms.ComboBox
+$cb_PcieAspm.width               = 108
+$cb_PcieAspm.height              = 20
+@('Off','Moderate','Maximum','Skip') | ForEach-Object {[void] $cb_PcieAspm.Items.Add($_)}
+$cb_PcieAspm.location            = New-Object System.Drawing.Point(204,191)
+$cb_PcieAspm.Font                = New-Object System.Drawing.Font('Calibri',9)
+$cb_PcieAspm.ForeColor           = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_PcieAspm.BackColor           = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+$cb_PcieAspm.Text                = 'Skip'
+
+$Label_devSleep                  = New-Object system.Windows.Forms.Label
+$Label_devSleep.text             = "Allow device power saving:"
+$Label_devSleep.AutoSize         = $true
+$Label_devSleep.width            = 25
+$Label_devSleep.height           = 10
+$Label_devSleep.location         = New-Object System.Drawing.Point(9,216)
+$Label_devSleep.Font             = New-Object System.Drawing.Font('Calibri',10)
+$Label_devSleep.ForeColor        = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_DevicePowerSaving            = New-Object system.Windows.Forms.ComboBox
+$cb_DevicePowerSaving.width      = 108
+$cb_DevicePowerSaving.height     = 20
+@('Disabled','Enabled','Skip') | ForEach-Object {[void] $cb_DevicePowerSaving.Items.Add($_)}
+$cb_DevicePowerSaving.location   = New-Object System.Drawing.Point(204,213)
+$cb_DevicePowerSaving.Font       = New-Object System.Drawing.Font('Calibri',9)
+$cb_DevicePowerSaving.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_DevicePowerSaving.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+$cb_DevicePowerSaving.Text       = 'Skip'
+
+$Label_allowWake                 = New-Object system.Windows.Forms.Label
+$Label_allowWake.text            = "Allow wake:"
+$Label_allowWake.AutoSize        = $true
+$Label_allowWake.width           = 25
+$Label_allowWake.height          = 10
+$Label_allowWake.location        = New-Object System.Drawing.Point(9,238)
+$Label_allowWake.Font            = New-Object System.Drawing.Font('Calibri',10)
+$Label_allowWake.ForeColor       = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_AllowWake                    = New-Object system.Windows.Forms.ComboBox
+$cb_AllowWake.width              = 108
+$cb_AllowWake.height             = 20
+@('Disabled','Enabled','Skip') | ForEach-Object {[void] $cb_AllowWake.Items.Add($_)}
+$cb_AllowWake.location           = New-Object System.Drawing.Point(204,235)
+$cb_AllowWake.Font               = New-Object System.Drawing.Font('Calibri',9)
+$cb_AllowWake.ForeColor          = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_AllowWake.BackColor          = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+$cb_AllowWake.Text               = 'Skip'
+
+$Label35                         = New-Object system.Windows.Forms.Label
+$Label35.text                    = "DisablePortScaling:"
+$Label35.AutoSize                = $true
+$Label35.width                   = 25
+$Label35.height                  = 10
+$Label35.location                = New-Object System.Drawing.Point(5,162)
+$Label35.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label35.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_DisablePortScaling           = New-Object system.Windows.Forms.ComboBox
+$cb_DisablePortScaling.width     = 108
+$cb_DisablePortScaling.height    = 20
+@('Disabled','Enabled') | ForEach-Object {[void] $cb_DisablePortScaling.Items.Add($_)}
+$cb_DisablePortScaling.location  = New-Object System.Drawing.Point(117,160)
+$cb_DisablePortScaling.Font      = New-Object System.Drawing.Font('Calibri',9)
+$cb_DisablePortScaling.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_DisablePortScaling.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label42                         = New-Object system.Windows.Forms.Label
+$Label42.text                    = "ManyCoreScaling:"
+$Label42.AutoSize                = $true
+$Label42.width                   = 25
+$Label42.height                  = 10
+$Label42.location                = New-Object System.Drawing.Point(5,186)
+$Label42.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label42.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_ManyCoreScaling              = New-Object system.Windows.Forms.ComboBox
+$cb_ManyCoreScaling.width        = 108
+$cb_ManyCoreScaling.height       = 20
+@('Disabled','Enabled') | ForEach-Object {[void] $cb_ManyCoreScaling.Items.Add($_)}
+$cb_ManyCoreScaling.location     = New-Object System.Drawing.Point(117,184)
+$cb_ManyCoreScaling.Font         = New-Object System.Drawing.Font('Calibri',9)
+$cb_ManyCoreScaling.ForeColor    = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_ManyCoreScaling.BackColor    = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Groupbox7                       = New-Object system.Windows.Forms.Groupbox
+$Groupbox7.height                = 576
+$Groupbox7.width                 = 312
+$Groupbox7.text                  = "Interface Settings"
+$Groupbox7.location              = New-Object System.Drawing.Point(252,314)
+
+$Label44                         = New-Object system.Windows.Forms.Label
+$Label44.text                    = "AdvertiseDefaultRoute:"
+$Label44.AutoSize                = $true
+$Label44.width                   = 25
+$Label44.height                  = 10
+$Label44.location                = New-Object System.Drawing.Point(10,40)
+$Label44.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label44.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_AdvertiseDefaultRoute        = New-Object system.Windows.Forms.ComboBox
+$cb_AdvertiseDefaultRoute.width  = 108
+$cb_AdvertiseDefaultRoute.height  = 20
+$cb_AdvertiseDefaultRoute.location  = New-Object System.Drawing.Point(194,37)
+$cb_AdvertiseDefaultRoute.Font   = New-Object System.Drawing.Font('Calibri',9)
+$cb_AdvertiseDefaultRoute.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_AdvertiseDefaultRoute.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label45                         = New-Object system.Windows.Forms.Label
+$Label45.text                    = "Advertising:"
+$Label45.AutoSize                = $true
+$Label45.width                   = 25
+$Label45.height                  = 10
+$Label45.location                = New-Object System.Drawing.Point(10,62)
+$Label45.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label45.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_Advertising                  = New-Object system.Windows.Forms.ComboBox
+$cb_Advertising.width            = 108
+$cb_Advertising.height           = 20
+$cb_Advertising.location         = New-Object System.Drawing.Point(194,59)
+$cb_Advertising.Font             = New-Object System.Drawing.Font('Calibri',9)
+$cb_Advertising.ForeColor        = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_Advertising.BackColor        = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label46                         = New-Object system.Windows.Forms.Label
+$Label46.text                    = "AutomaticMetric:"
+$Label46.AutoSize                = $true
+$Label46.width                   = 25
+$Label46.height                  = 10
+$Label46.location                = New-Object System.Drawing.Point(10,84)
+$Label46.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label46.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_AutomaticMetric              = New-Object system.Windows.Forms.ComboBox
+$cb_AutomaticMetric.width        = 108
+$cb_AutomaticMetric.height       = 20
+$cb_AutomaticMetric.location     = New-Object System.Drawing.Point(194,81)
+$cb_AutomaticMetric.Font         = New-Object System.Drawing.Font('Calibri',9)
+$cb_AutomaticMetric.ForeColor    = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_AutomaticMetric.BackColor    = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$cb_ClampMss                     = New-Object system.Windows.Forms.ComboBox
+$cb_ClampMss.width               = 108
+$cb_ClampMss.height              = 20
+$cb_ClampMss.location            = New-Object System.Drawing.Point(194,103)
+$cb_ClampMss.Font                = New-Object System.Drawing.Font('Calibri',9)
+$cb_ClampMss.ForeColor           = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_ClampMss.BackColor           = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label47                         = New-Object system.Windows.Forms.Label
+$Label47.text                    = "ClampMss:"
+$Label47.AutoSize                = $true
+$Label47.width                   = 25
+$Label47.height                  = 10
+$Label47.location                = New-Object System.Drawing.Point(10,106)
+$Label47.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label47.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_DirectedMacWolPattern        = New-Object system.Windows.Forms.ComboBox
+$cb_DirectedMacWolPattern.width  = 108
+$cb_DirectedMacWolPattern.height  = 20
+$cb_DirectedMacWolPattern.location  = New-Object System.Drawing.Point(194,125)
+$cb_DirectedMacWolPattern.Font   = New-Object System.Drawing.Font('Calibri',9)
+$cb_DirectedMacWolPattern.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_DirectedMacWolPattern.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label48                         = New-Object system.Windows.Forms.Label
+$Label48.text                    = "DirectedMacWolPattern:"
+$Label48.AutoSize                = $true
+$Label48.width                   = 25
+$Label48.height                  = 10
+$Label48.location                = New-Object System.Drawing.Point(10,128)
+$Label48.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label48.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$Label49                         = New-Object system.Windows.Forms.Label
+$Label49.text                    = "EcnMarking:"
+$Label49.AutoSize                = $true
+$Label49.width                   = 25
+$Label49.height                  = 10
+$Label49.location                = New-Object System.Drawing.Point(10,150)
+$Label49.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label49.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_EcnMarking                   = New-Object system.Windows.Forms.ComboBox
+$cb_EcnMarking.width             = 108
+$cb_EcnMarking.height            = 20
+$cb_EcnMarking.location          = New-Object System.Drawing.Point(194,147)
+$cb_EcnMarking.Font              = New-Object System.Drawing.Font('Calibri',9)
+$cb_EcnMarking.ForeColor         = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_EcnMarking.BackColor         = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label50                         = New-Object system.Windows.Forms.Label
+$Label50.text                    = "ForceArpNdWolPattern:"
+$Label50.AutoSize                = $true
+$Label50.width                   = 25
+$Label50.height                  = 10
+$Label50.location                = New-Object System.Drawing.Point(10,172)
+$Label50.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label50.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_ForceArpNdWolPattern         = New-Object system.Windows.Forms.ComboBox
+$cb_ForceArpNdWolPattern.width   = 108
+$cb_ForceArpNdWolPattern.height  = 20
+$cb_ForceArpNdWolPattern.location  = New-Object System.Drawing.Point(194,169)
+$cb_ForceArpNdWolPattern.Font    = New-Object System.Drawing.Font('Calibri',9)
+$cb_ForceArpNdWolPattern.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_ForceArpNdWolPattern.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label51                         = New-Object system.Windows.Forms.Label
+$Label51.text                    = "Forwarding:"
+$Label51.AutoSize                = $true
+$Label51.width                   = 25
+$Label51.height                  = 10
+$Label51.location                = New-Object System.Drawing.Point(10,194)
+$Label51.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label51.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_Forwarding                   = New-Object system.Windows.Forms.ComboBox
+$cb_Forwarding.width             = 108
+$cb_Forwarding.height            = 20
+$cb_Forwarding.location          = New-Object System.Drawing.Point(194,191)
+$cb_Forwarding.Font              = New-Object System.Drawing.Font('Calibri',9)
+$cb_Forwarding.ForeColor         = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_Forwarding.BackColor         = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$cb_IgnoreDefaultRoutes          = New-Object system.Windows.Forms.ComboBox
+$cb_IgnoreDefaultRoutes.width    = 108
+$cb_IgnoreDefaultRoutes.height   = 20
+$cb_IgnoreDefaultRoutes.location  = New-Object System.Drawing.Point(194,213)
+$cb_IgnoreDefaultRoutes.Font     = New-Object System.Drawing.Font('Calibri',9)
+$cb_IgnoreDefaultRoutes.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_IgnoreDefaultRoutes.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label52                         = New-Object system.Windows.Forms.Label
+$Label52.text                    = "IgnoreDefaultRoutes:"
+$Label52.AutoSize                = $true
+$Label52.width                   = 25
+$Label52.height                  = 10
+$Label52.location                = New-Object System.Drawing.Point(10,216)
+$Label52.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label52.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$Label53                         = New-Object system.Windows.Forms.Label
+$Label53.text                    = "ManagedAddressConfiguration:"
+$Label53.AutoSize                = $true
+$Label53.width                   = 25
+$Label53.height                  = 10
+$Label53.location                = New-Object System.Drawing.Point(10,238)
+$Label53.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label53.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_ManagedAddressConfiguration   = New-Object system.Windows.Forms.ComboBox
+$cb_ManagedAddressConfiguration.width  = 108
+$cb_ManagedAddressConfiguration.height  = 20
+$cb_ManagedAddressConfiguration.location  = New-Object System.Drawing.Point(194,235)
+$cb_ManagedAddressConfiguration.Font  = New-Object System.Drawing.Font('Calibri',9)
+$cb_ManagedAddressConfiguration.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_ManagedAddressConfiguration.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label54                         = New-Object system.Windows.Forms.Label
+$Label54.text                    = "NeighborDiscoverySupported:"
+$Label54.AutoSize                = $true
+$Label54.width                   = 25
+$Label54.height                  = 10
+$Label54.location                = New-Object System.Drawing.Point(10,260)
+$Label54.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label54.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_NeighborDiscoverySupported   = New-Object system.Windows.Forms.ComboBox
+$cb_NeighborDiscoverySupported.width  = 108
+$cb_NeighborDiscoverySupported.height  = 20
+$cb_NeighborDiscoverySupported.location  = New-Object System.Drawing.Point(194,257)
+$cb_NeighborDiscoverySupported.Font  = New-Object System.Drawing.Font('Calibri',9)
+$cb_NeighborDiscoverySupported.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_NeighborDiscoverySupported.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label55                         = New-Object system.Windows.Forms.Label
+$Label55.text                    = "NeighborUnreachDetection:"
+$Label55.AutoSize                = $true
+$Label55.width                   = 25
+$Label55.height                  = 10
+$Label55.location                = New-Object System.Drawing.Point(11,282)
+$Label55.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label55.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_NeighborUnreachabilityDetection   = New-Object system.Windows.Forms.ComboBox
+$cb_NeighborUnreachabilityDetection.width  = 108
+$cb_NeighborUnreachabilityDetection.height  = 20
+$cb_NeighborUnreachabilityDetection.location  = New-Object System.Drawing.Point(194,279)
+$cb_NeighborUnreachabilityDetection.Font  = New-Object System.Drawing.Font('Calibri',9)
+$cb_NeighborUnreachabilityDetection.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_NeighborUnreachabilityDetection.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label56                         = New-Object system.Windows.Forms.Label
+$Label56.text                    = "OtherStatefulConfiguration:"
+$Label56.AutoSize                = $true
+$Label56.width                   = 25
+$Label56.height                  = 10
+$Label56.location                = New-Object System.Drawing.Point(10,304)
+$Label56.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label56.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_OtherStatefulConfiguration   = New-Object system.Windows.Forms.ComboBox
+$cb_OtherStatefulConfiguration.width  = 108
+$cb_OtherStatefulConfiguration.height  = 20
+$cb_OtherStatefulConfiguration.location  = New-Object System.Drawing.Point(194,301)
+$cb_OtherStatefulConfiguration.Font  = New-Object System.Drawing.Font('Calibri',9)
+$cb_OtherStatefulConfiguration.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_OtherStatefulConfiguration.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label57                         = New-Object system.Windows.Forms.Label
+$Label57.text                    = "RouterDiscovery:"
+$Label57.AutoSize                = $true
+$Label57.width                   = 25
+$Label57.height                  = 10
+$Label57.location                = New-Object System.Drawing.Point(10,326)
+$Label57.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label57.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_RouterDiscovery              = New-Object system.Windows.Forms.ComboBox
+$cb_RouterDiscovery.width        = 108
+$cb_RouterDiscovery.height       = 20
+$cb_RouterDiscovery.location     = New-Object System.Drawing.Point(194,323)
+$cb_RouterDiscovery.Font         = New-Object System.Drawing.Font('Calibri',9)
+$cb_RouterDiscovery.ForeColor    = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_RouterDiscovery.BackColor    = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label58                         = New-Object system.Windows.Forms.Label
+$Label58.text                    = "Store:"
+$Label58.AutoSize                = $true
+$Label58.width                   = 25
+$Label58.height                  = 10
+$Label58.location                = New-Object System.Drawing.Point(10,348)
+$Label58.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label58.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_Store                        = New-Object system.Windows.Forms.ComboBox
+$cb_Store.width                  = 108
+$cb_Store.height                 = 20
+$cb_Store.location               = New-Object System.Drawing.Point(194,345)
+$cb_Store.Font                   = New-Object System.Drawing.Font('Calibri',9)
+$cb_Store.ForeColor              = [System.Drawing.ColorTranslator]::FromHtml("#f5a623")
+$cb_Store.BackColor              = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label59                         = New-Object system.Windows.Forms.Label
+$Label59.text                    = "WeakHostReceive:"
+$Label59.AutoSize                = $true
+$Label59.width                   = 25
+$Label59.height                  = 10
+$Label59.location                = New-Object System.Drawing.Point(10,370)
+$Label59.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label59.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_WeakHostReceive              = New-Object system.Windows.Forms.ComboBox
+$cb_WeakHostReceive.width        = 108
+$cb_WeakHostReceive.height       = 20
+$cb_WeakHostReceive.location     = New-Object System.Drawing.Point(194,367)
+$cb_WeakHostReceive.Font         = New-Object System.Drawing.Font('Calibri',9)
+$cb_WeakHostReceive.ForeColor    = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_WeakHostReceive.BackColor    = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label60                         = New-Object system.Windows.Forms.Label
+$Label60.text                    = "WeakHostSend:"
+$Label60.AutoSize                = $true
+$Label60.width                   = 25
+$Label60.height                  = 10
+$Label60.location                = New-Object System.Drawing.Point(10,392)
+$Label60.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label60.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_WeakHostSend                 = New-Object system.Windows.Forms.ComboBox
+$cb_WeakHostSend.width           = 108
+$cb_WeakHostSend.height          = 20
+$cb_WeakHostSend.location        = New-Object System.Drawing.Point(194,389)
+$cb_WeakHostSend.Font            = New-Object System.Drawing.Font('Calibri',9)
+$cb_WeakHostSend.ForeColor       = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_WeakHostSend.BackColor       = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label61                         = New-Object system.Windows.Forms.Label
+$Label61.text                    = "CurrentHopLimit:"
+$Label61.AutoSize                = $true
+$Label61.width                   = 25
+$Label61.height                  = 10
+$Label61.location                = New-Object System.Drawing.Point(10,414)
+$Label61.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label61.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$tb_CurrentHopLimit              = New-Object system.Windows.Forms.TextBox
+$tb_CurrentHopLimit.multiline    = $false
+$tb_CurrentHopLimit.width        = 71
+$tb_CurrentHopLimit.height       = 20
+$tb_CurrentHopLimit.location     = New-Object System.Drawing.Point(195,411)
+$tb_CurrentHopLimit.Font         = New-Object System.Drawing.Font('Calibri',10)
+$tb_CurrentHopLimit.ForeColor    = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$tb_CurrentHopLimit.BackColor    = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label62                         = New-Object system.Windows.Forms.Label
+$Label62.text                    = "BaseReachableTime:"
+$Label62.AutoSize                = $true
+$Label62.width                   = 25
+$Label62.height                  = 10
+$Label62.location                = New-Object System.Drawing.Point(10,436)
+$Label62.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label62.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$tb_BaseReachableTime            = New-Object system.Windows.Forms.TextBox
+$tb_BaseReachableTime.multiline  = $false
+$tb_BaseReachableTime.width      = 71
+$tb_BaseReachableTime.height     = 20
+$tb_BaseReachableTime.location   = New-Object System.Drawing.Point(195,433)
+$tb_BaseReachableTime.Font       = New-Object System.Drawing.Font('Calibri',10)
+$tb_BaseReachableTime.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$tb_BaseReachableTime.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$tb_ReachableTime                = New-Object system.Windows.Forms.TextBox
+$tb_ReachableTime.multiline      = $false
+$tb_ReachableTime.width          = 71
+$tb_ReachableTime.height         = 20
+$tb_ReachableTime.location       = New-Object System.Drawing.Point(195,477)
+$tb_ReachableTime.Font           = New-Object System.Drawing.Font('Calibri',10)
+$tb_ReachableTime.ForeColor      = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$tb_ReachableTime.BackColor      = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label63                         = New-Object system.Windows.Forms.Label
+$Label63.text                    = "ReachableTime:"
+$Label63.AutoSize                = $true
+$Label63.width                   = 25
+$Label63.height                  = 10
+$Label63.location                = New-Object System.Drawing.Point(10,480)
+$Label63.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label63.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$Label64                         = New-Object system.Windows.Forms.Label
+$Label64.text                    = "DadRetransmitTime:"
+$Label64.AutoSize                = $true
+$Label64.width                   = 25
+$Label64.height                  = 10
+$Label64.location                = New-Object System.Drawing.Point(10,502)
+$Label64.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label64.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$tb_DadRetransmitTime            = New-Object system.Windows.Forms.TextBox
+$tb_DadRetransmitTime.multiline  = $false
+$tb_DadRetransmitTime.width      = 71
+$tb_DadRetransmitTime.height     = 20
+$tb_DadRetransmitTime.location   = New-Object System.Drawing.Point(195,499)
+$tb_DadRetransmitTime.Font       = New-Object System.Drawing.Font('Calibri',10)
+$tb_DadRetransmitTime.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$tb_DadRetransmitTime.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label65                         = New-Object system.Windows.Forms.Label
+$Label65.text                    = "DadTransmits:"
+$Label65.AutoSize                = $true
+$Label65.width                   = 25
+$Label65.height                  = 10
+$Label65.location                = New-Object System.Drawing.Point(10,524)
+$Label65.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label65.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$tb_DadTransmits                 = New-Object system.Windows.Forms.TextBox
+$tb_DadTransmits.multiline       = $false
+$tb_DadTransmits.width           = 71
+$tb_DadTransmits.height          = 20
+$tb_DadTransmits.location        = New-Object System.Drawing.Point(195,521)
+$tb_DadTransmits.Font            = New-Object System.Drawing.Font('Calibri',10)
+$tb_DadTransmits.ForeColor       = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$tb_DadTransmits.BackColor       = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label66                         = New-Object system.Windows.Forms.Label
+$Label66.text                    = "NlMtu:"
+$Label66.AutoSize                = $true
+$Label66.width                   = 25
+$Label66.height                  = 10
+$Label66.location                = New-Object System.Drawing.Point(10,546)
+$Label66.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label66.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$tb_NlMtu                        = New-Object system.Windows.Forms.TextBox
+$tb_NlMtu.multiline              = $false
+$tb_NlMtu.width                  = 71
+$tb_NlMtu.height                 = 20
+$tb_NlMtu.location               = New-Object System.Drawing.Point(195,543)
+$tb_NlMtu.Font                   = New-Object System.Drawing.Font('Calibri',10)
+$tb_NlMtu.ForeColor              = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$tb_NlMtu.BackColor              = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label67                         = New-Object system.Windows.Forms.Label
+$Label67.text                    = "RetransmitTime:"
+$Label67.AutoSize                = $true
+$Label67.width                   = 25
+$Label67.height                  = 10
+$Label67.location                = New-Object System.Drawing.Point(10,458)
+$Label67.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label67.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$tb_RetransmitTime               = New-Object system.Windows.Forms.TextBox
+$tb_RetransmitTime.multiline     = $false
+$tb_RetransmitTime.width         = 71
+$tb_RetransmitTime.height        = 20
+$tb_RetransmitTime.location      = New-Object System.Drawing.Point(195,455)
+$tb_RetransmitTime.Font          = New-Object System.Drawing.Font('Calibri',10)
+$tb_RetransmitTime.ForeColor     = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$tb_RetransmitTime.BackColor     = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$btn_applyall                    = New-Object system.Windows.Forms.Button
+$btn_applyall.text               = "Apply All"
+$btn_applyall.width              = 78
+$btn_applyall.height             = 20
+$btn_applyall.location           = New-Object System.Drawing.Point(427,16)
+$btn_applyall.Font               = New-Object System.Drawing.Font('Calibri',10)
+$btn_applyall.ForeColor          = [System.Drawing.ColorTranslator]::FromHtml("#7ed321")
+
+$Groupbox6                       = New-Object system.Windows.Forms.Groupbox
+$Groupbox6.height                = 111
+$Groupbox6.width                 = 230
+$Groupbox6.text                  = "Interrupt Settings"
+$Groupbox6.location              = New-Object System.Drawing.Point(10,443)
+
+$lb_MsiMode                      = New-Object system.Windows.Forms.Label
+$lb_MsiMode.text                 = "MSI Mode:"
+$lb_MsiMode.AutoSize             = $true
+$lb_MsiMode.width                = 25
+$lb_MsiMode.height               = 10
+$lb_MsiMode.location             = New-Object System.Drawing.Point(7,15)
+$lb_MsiMode.Font                 = New-Object System.Drawing.Font('Calibri',10)
+$lb_MsiMode.ForeColor            = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_MsiMode                      = New-Object system.Windows.Forms.ComboBox
+$cb_MsiMode.width                = 108
+$cb_MsiMode.height               = 20
+@('Disabled','Enabled') | ForEach-Object {[void] $cb_MsiMode.Items.Add($_)}
+$cb_MsiMode.location             = New-Object System.Drawing.Point(114,11)
+$cb_MsiMode.Font                 = New-Object System.Drawing.Font('Calibri',9)
+$cb_MsiMode.ForeColor            = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_MsiMode.BackColor            = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$lb_InterruptPriority            = New-Object system.Windows.Forms.Label
+$lb_InterruptPriority.text       = "Interrupt Priority:"
+$lb_InterruptPriority.AutoSize   = $true
+$lb_InterruptPriority.width      = 25
+$lb_InterruptPriority.height     = 10
+$lb_InterruptPriority.location   = New-Object System.Drawing.Point(7,37)
+$lb_InterruptPriority.Font       = New-Object System.Drawing.Font('Calibri',10)
+$lb_InterruptPriority.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_InterruptPriority            = New-Object system.Windows.Forms.ComboBox
+$cb_InterruptPriority.width      = 108
+$cb_InterruptPriority.height     = 20
+@('Undefined','Low','Normal','High') | ForEach-Object {[void] $cb_InterruptPriority.Items.Add($_)}
+$cb_InterruptPriority.location   = New-Object System.Drawing.Point(114,33)
+$cb_InterruptPriority.Font       = New-Object System.Drawing.Font('Calibri',9)
+$cb_InterruptPriority.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_InterruptPriority.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$lb_DevicePolicy                 = New-Object system.Windows.Forms.Label
+$lb_DevicePolicy.text            = "DevicePolicy:"
+$lb_DevicePolicy.AutoSize        = $true
+$lb_DevicePolicy.width           = 25
+$lb_DevicePolicy.height          = 10
+$lb_DevicePolicy.location        = New-Object System.Drawing.Point(7,60)
+$lb_DevicePolicy.Font            = New-Object System.Drawing.Font('Calibri',10)
+$lb_DevicePolicy.ForeColor       = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_DevicePolicy                 = New-Object system.Windows.Forms.ComboBox
+$cb_DevicePolicy.width           = 214
+$cb_DevicePolicy.height          = 20
+@('MachineDefault','AllCloseProcessors','OneCloseProcessor','AllProcessorsInMachine','SpecifiedProcessors','SreadMessagesAcrossAllProcessors') | ForEach-Object {[void] $cb_DevicePolicy.Items.Add($_)}
+$cb_DevicePolicy.location        = New-Object System.Drawing.Point(7,81)
+$cb_DevicePolicy.Font            = New-Object System.Drawing.Font('Calibri',9)
+$cb_DevicePolicy.ForeColor       = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_DevicePolicy.BackColor       = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$btn_applyInterfaceSettings      = New-Object system.Windows.Forms.Button
+$btn_applyInterfaceSettings.text  = "Apply"
+$btn_applyInterfaceSettings.width  = 60
+$btn_applyInterfaceSettings.height  = 21
+$btn_applyInterfaceSettings.location  = New-Object System.Drawing.Point(252,894)
+$btn_applyInterfaceSettings.Font  = New-Object System.Drawing.Font('Calibri',10)
+$btn_applyInterfaceSettings.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$Label69                         = New-Object system.Windows.Forms.Label
+$Label69.text                    = "ms"
+$Label69.AutoSize                = $true
+$Label69.width                   = 25
+$Label69.height                  = 10
+$Label69.location                = New-Object System.Drawing.Point(269,436)
+$Label69.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label69.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$Label70                         = New-Object system.Windows.Forms.Label
+$Label70.text                    = "ms"
+$Label70.AutoSize                = $true
+$Label70.width                   = 25
+$Label70.height                  = 10
+$Label70.location                = New-Object System.Drawing.Point(269,458)
+$Label70.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label70.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$Label71                         = New-Object system.Windows.Forms.Label
+$Label71.text                    = "ms"
+$Label71.AutoSize                = $true
+$Label71.width                   = 25
+$Label71.height                  = 10
+$Label71.location                = New-Object System.Drawing.Point(269,480)
+$Label71.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label71.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$Label72                         = New-Object system.Windows.Forms.Label
+$Label72.text                    = "bytes"
+$Label72.AutoSize                = $true
+$Label72.width                   = 25
+$Label72.height                  = 10
+$Label72.location                = New-Object System.Drawing.Point(269,546)
+$Label72.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label72.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$Label73                         = New-Object system.Windows.Forms.Label
+$Label73.text                    = "TxIntDelay:"
+$Label73.AutoSize                = $true
+$Label73.width                   = 25
+$Label73.height                  = 10
+$Label73.location                = New-Object System.Drawing.Point(9,368)
+$Label73.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label73.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$tb_TxIntDelay                   = New-Object system.Windows.Forms.TextBox
+$tb_TxIntDelay.multiline         = $false
+$tb_TxIntDelay.width             = 71
+$tb_TxIntDelay.height            = 20
+$tb_TxIntDelay.location          = New-Object System.Drawing.Point(193,365)
+$tb_TxIntDelay.Font              = New-Object System.Drawing.Font('Calibri',10)
+$tb_TxIntDelay.ForeColor         = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$tb_TxIntDelay.BackColor         = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label74                         = New-Object system.Windows.Forms.Label
+$Label74.text                    = "PacketDirect:"
+$Label74.AutoSize                = $true
+$Label74.width                   = 25
+$Label74.height                  = 10
+$Label74.location                = New-Object System.Drawing.Point(9,390)
+$Label74.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label74.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_PacketDirect                 = New-Object system.Windows.Forms.ComboBox
+$cb_PacketDirect.width           = 190
+$cb_PacketDirect.height          = 20
+@('Disabled','Enabled','Undefined') | ForEach-Object {[void] $cb_PacketDirect.Items.Add($_)}
+$cb_PacketDirect.location        = New-Object System.Drawing.Point(193,387)
+$cb_PacketDirect.Font            = New-Object System.Drawing.Font('Calibri',9)
+$cb_PacketDirect.ForeColor       = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_PacketDirect.BackColor       = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label75                         = New-Object system.Windows.Forms.Label
+$Label75.text                    = "Coalesce:"
+$Label75.AutoSize                = $true
+$Label75.width                   = 25
+$Label75.height                  = 10
+$Label75.location                = New-Object System.Drawing.Point(9,412)
+$Label75.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label75.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_EnableCoalesce               = New-Object system.Windows.Forms.ComboBox
+$cb_EnableCoalesce.width         = 190
+$cb_EnableCoalesce.height        = 20
+@('Disabled','Enabled','Undefined') | ForEach-Object {[void] $cb_EnableCoalesce.Items.Add($_)}
+$cb_EnableCoalesce.location      = New-Object System.Drawing.Point(193,409)
+$cb_EnableCoalesce.Font          = New-Object System.Drawing.Font('Calibri',9)
+$cb_EnableCoalesce.ForeColor     = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_EnableCoalesce.BackColor     = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label76                         = New-Object system.Windows.Forms.Label
+$Label76.text                    = "UdpTxScaling:"
+$Label76.AutoSize                = $true
+$Label76.width                   = 25
+$Label76.height                  = 10
+$Label76.location                = New-Object System.Drawing.Point(9,457)
+$Label76.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label76.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_EnableUdpTxScaling           = New-Object system.Windows.Forms.ComboBox
+$cb_EnableUdpTxScaling.width     = 190
+$cb_EnableUdpTxScaling.height    = 20
+@('Disabled','Enabled','Undefined') | ForEach-Object {[void] $cb_EnableUdpTxScaling.Items.Add($_)}
+$cb_EnableUdpTxScaling.location  = New-Object System.Drawing.Point(193,454)
+$cb_EnableUdpTxScaling.Font      = New-Object System.Drawing.Font('Calibri',9)
+$cb_EnableUdpTxScaling.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_EnableUdpTxScaling.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$cb_IPv6                         = New-Object system.Windows.Forms.CheckBox
+$cb_IPv6.text                    = "IPv6"
+$cb_IPv6.AutoSize                = $true
+$cb_IPv6.width                   = 95
+$cb_IPv6.height                  = 20
+$cb_IPv6.location                = New-Object System.Drawing.Point(503,300)
+$cb_IPv6.Font                    = New-Object System.Drawing.Font('Calibri',7)
+$cb_IPv6.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_IPv4                         = New-Object system.Windows.Forms.CheckBox
+$cb_IPv4.text                    = "IPv4"
+$cb_IPv4.AutoSize                = $true
+$cb_IPv4.width                   = 95
+$cb_IPv4.height                  = 20
+$cb_IPv4.location                = New-Object System.Drawing.Point(456,300)
+$cb_IPv4.Font                    = New-Object System.Drawing.Font('Calibri',7)
+$cb_IPv4.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$btn_rssaddsupport               = New-Object system.Windows.Forms.Button
+$btn_rssaddsupport.text          = "Enable RSS Support"
+$btn_rssaddsupport.width         = 178
+$btn_rssaddsupport.height        = 21
+$btn_rssaddsupport.location      = New-Object System.Drawing.Point(10,339)
+$btn_rssaddsupport.Font          = New-Object System.Drawing.Font('Calibri',9)
+$btn_rssaddsupport.ForeColor     = [System.Drawing.ColorTranslator]::FromHtml("#b8e986")
+
+$Groupbox8                       = New-Object system.Windows.Forms.Groupbox
+$Groupbox8.height                = 584
+$Groupbox8.width                 = 386
+$Groupbox8.text                  = "Tweaks"
+$Groupbox8.location              = New-Object System.Drawing.Point(975,93)
+
+
+
+$Groupbox_Test = New-Object System.Windows.Forms.GroupBox
+$Groupbox_Test.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2") 
+$Groupbox_Test.Font      = New-Object System.Drawing.Font('Calibri', 10)
+$Groupbox_Test.Text     = "Test / Diagnostics"
+$Groupbox_Test.Size     = New-Object System.Drawing.Size(386, 195) 
+$Groupbox_Test.Location = New-Object System.Drawing.Point(975, 715)
+$Form.Controls.Add($Groupbox_Test)
+
+$btn_TestPing                    = New-Object system.Windows.Forms.Button
+$btn_TestPing.text               = "Ping test (1.1.1.1)"
+$btn_TestPing.width              = 350
+$btn_TestPing.height             = 28
+$btn_TestPing.location           = New-Object System.Drawing.Point(15,38)
+$btn_TestPing.Font               = New-Object System.Drawing.Font('Calibri',10,[System.Drawing.FontStyle]::Bold)
+$btn_TestPing.ForeColor          = $ColorActionText
+$btn_TestPing.BackColor          = $ColorQuickAction
+$btn_TestPing.FlatStyle          = 'Flat'
+$btn_TestPing.Cursor             = [System.Windows.Forms.Cursors]::Hand
+
+$btn_TestTraceroute              = New-Object system.Windows.Forms.Button
+$btn_TestTraceroute.text         = "Traceroute (1.1.1.1)"
+$btn_TestTraceroute.width        = 350
+$btn_TestTraceroute.height       = 28
+$btn_TestTraceroute.location     = New-Object System.Drawing.Point(15,66)
+$btn_TestTraceroute.Font         = New-Object System.Drawing.Font('Calibri',10,[System.Drawing.FontStyle]::Bold)
+$btn_TestTraceroute.ForeColor    = $ColorActionText
+$btn_TestTraceroute.BackColor    = $ColorQuickAction
+$btn_TestTraceroute.FlatStyle    = 'Flat'
+$btn_TestTraceroute.Cursor             = [System.Windows.Forms.Cursors]::Hand
+
+$btn_TestMtu                     = New-Object system.Windows.Forms.Button
+$btn_TestMtu.text                = "Calcolo MTU"
+$btn_TestMtu.width               = 350
+$btn_TestMtu.height              = 28
+$btn_TestMtu.location            = New-Object System.Drawing.Point(15,94)
+$btn_TestMtu.Font                = New-Object System.Drawing.Font('Calibri',10,[System.Drawing.FontStyle]::Bold)
+$btn_TestMtu.ForeColor           = $ColorActionText
+$btn_TestMtu.BackColor           = $ColorQuickAction
+$btn_TestMtu.FlatStyle           = 'Flat'
+$btn_TestMtu.Cursor             = [System.Windows.Forms.Cursors]::Hand
+
+$btn_TestBufferbloat             = New-Object system.Windows.Forms.Button
+$btn_TestBufferbloat.text        = "Bufferbloat"
+$btn_TestBufferbloat.width       = 350
+$btn_TestBufferbloat.height      = 28
+$btn_TestBufferbloat.location    = New-Object System.Drawing.Point(15,122)
+$btn_TestBufferbloat.Font        = New-Object System.Drawing.Font('Calibri',10,[System.Drawing.FontStyle]::Bold)
+$btn_TestBufferbloat.ForeColor   = $ColorActionText
+$btn_TestBufferbloat.BackColor   = $ColorQuickAction
+$btn_TestBufferbloat.FlatStyle   = 'Flat'
+$btn_TestBufferbloat.Cursor             = [System.Windows.Forms.Cursors]::Hand
+
+$btn_TestDNSJumper                    = New-Object System.Windows.Forms.Button
+$btn_TestDNSJumper.text               = "DNS Jumper"
+$btn_TestDNSJumper.width              = 350
+$btn_TestDNSJumper.height             = 28
+$btn_TestDNSJumper.location           = New-Object System.Drawing.Point(15, 150) 
+$btn_TestDNSJumper.Font               = New-Object System.Drawing.Font('Calibri',10,[System.Drawing.FontStyle]::Bold)
+$btn_TestDNSJumper.ForeColor          = $ColorActionText
+$btn_TestDNSJumper.BackColor          = $ColorQuickAction
+$btn_TestDNSJumper.FlatStyle          = 'Flat'
+$btn_TestDNSJumper.Cursor             = [System.Windows.Forms.Cursors]::Hand
+
+$btn_TestPing.Add_Click({
+    Start-ConsoleTest -Command "ping -n 20 1.1.1.1" -Title "Ping test verso 1.1.1.1"
+})
+
+$btn_TestTraceroute.Add_Click({
+    Start-ConsoleTest -Command "tracert 1.1.1.1" -Title "Traceroute verso 1.1.1.1"
+})
+
+$btn_TestMtu.Add_Click({
+    # Funzione di test MTU con binary search (molto veloce)
+    function Find-MaxMtu {
+        param([string]$Target = "8.8.8.8", [int]$Timeout = 1000)
+
+        $low  = 576   # minimo garantito da RFC 791
+        $high = 9000  # massimo ragionevole (Jumbo Frame)
+        $best = 0
+
+        while ($low -le $high) {
+            $mid = ($low + $high) -shr 1  # divisione intera per 2
+            $ping = Start-Process -FilePath ping -ArgumentList "-n","1","-w",$Timeout,"-f","-l",$mid,$Target -Wait -PassThru -NoNewWindow
+            if ($ping.ExitCode -eq 0) {
+                $best = $mid
+                $low  = $mid + 1
+            } else {
+                $high = $mid - 1
+            }
+        }
+        return $best
+    }
+
+    # Inizio test con messaggio
+    $form.Title = "Test MTU automatico in corso..."
+    [System.Windows.Forms.MessageBox]::Show("Test MTU automatico in corso`nAttendere 10-20 secondi...", "MTU Test", "OK", "Information") | Out-Null
+
+    # Trova MTU massimo payload
+    $maxPayload = Find-MaxMtu -Target "8.8.8.8" -Timeout 1200
+
+    if ($maxPayload -le 500) {
+        [System.Windows.Forms.MessageBox]::Show("Errore: impossibile raggiungere 8.8.8.8 o MTU troppo basso.`nControlla la connessione.", "Errore MTU", "OK", "Error")
+        return
+    }
+
+    # Calcola MTU reale (payload + 28 byte IP+ICMP header)
+    $realMtu = $maxPayload + 28
+
+    # Trova l'interfaccia attiva (quella con gateway default IPv4)
+    $activeInterface = Get-NetRoute -DestinationPrefix "0.0.0.0/0" -ErrorAction SilentlyContinue | 
+                       Select-Object -First 1 -ExpandProperty InterfaceAlias
+
+    if (-not $activeInterface) {
+        $activeInterface = (Get-NetAdapter -Physical | Where-Object Status -eq "Up" | Select-Object -First 1).Name
+    }
+
+    if (-not $activeInterface) {
+        [System.Windows.Forms.MessageBox]::Show("Impossibile determinare l'interfaccia di rete attiva.", "Errore", "OK", "Error")
+        return
+    }
+
+    # Applica il nuovo MTU
+    try {
+        Set-NetIPInterface -InterfaceAlias $activeInterface -AddressFamily IPv4 -NlMtu $realMtu | Out-Null
+        $status = "APPLICATO con successo"
+        $icon   = "Information"
+    } catch {
+        $status = "FALLITO (esegui come Amministratore)"
+        $icon   = "Error"
+    }
+
+    # Risultato finale in popup
+    $resultText = @"
+TEST MTU COMPLETATO
+
+Payload massimo trovato   : $maxPayload byte
+MTU reale calcolato       : $realMtu byte
+Interfaccia di rete       : $activeInterface
+Stato impostazione        : $status
+
+Riavvia il gioco o l'applicazione per applicare completamente.
+"@
+    [System.Windows.Forms.MessageBox]::Show($resultText, "Risultato Test MTU", "OK", $icon)
+    $form.Title = $originalTitle   # ripristina titolo finestra se vuoi
+})
+
+$btn_TestBufferbloat.Add_Click({
+    try { Start-Process "https://www.waveform.com/tools/bufferbloat" | Out-Null } catch {
+        [System.Windows.Forms.MessageBox]::Show("Impossibile aprire il browser: $($_.Exception.Message)","Bufferbloat",[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+    }
+})
+
+$btn_TestDNSJumper.Add_Click({
+    Start-Process "https://dnsjumper.net/"
+})
+
+$Groupbox_Test.Controls.Add($btn_TestPing)
+$Groupbox_Test.Controls.Add($btn_TestTraceroute)
+$Groupbox_Test.Controls.Add($btn_TestMtu)
+$Groupbox_Test.Controls.Add($btn_TestBufferbloat)
+$Groupbox_Test.Controls.Add($btn_TestDNSJumper)
+
+# === Groupbox9: TCP / OS Offloads ===
+$Groupbox9                       = New-Object system.Windows.Forms.Groupbox
+$Groupbox9.height                = 720
+$Groupbox9.width                 = 700
+$Groupbox9.text                  = "TCP / OS Offloads"
+$Groupbox9.location              = New-Object System.Drawing.Point(1365,93)
+$Groupbox9.Font                  = New-Object System.Drawing.Font('Calibri',10)
+$Groupbox9.ForeColor             = $ColorPrimary
+
+$lbl_Autotune                    = New-Object system.Windows.Forms.Label
+$lbl_Autotune.AutoSize           = $false
+$lbl_Autotune.TextAlign          = 'MiddleCenter'
+$lbl_Autotune.location           = New-Object System.Drawing.Point(15,25)
+$lbl_Autotune.Font               = New-Object System.Drawing.Font('Calibri',10)
+$lbl_Autotune.ForeColor          = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$lbl_Autotune.Text               = "Auto-Tuning: " + (Get-TcpAutoTuningState)
+$lbl_Autotune.Width              = 160
+$lbl_Autotune.Height             = 26
+
+$lbl_Autotune.BorderStyle = 'None'
+$lbl_Autotune.add_Paint({ $_.Graphics.DrawRectangle([System.Drawing.Pens]::Yellow, 0,0,$this.Width-1,$this.Height-1) })
+
+$lbl_TcpWindowAutoTuning         = New-Object system.Windows.Forms.Label
+$lbl_TcpWindowAutoTuning.AutoSize= $true
+$lbl_TcpWindowAutoTuning.location= New-Object System.Drawing.Point(15,55)
+$lbl_TcpWindowAutoTuning.Font    = New-Object System.Drawing.Font('Calibri',10)
+$lbl_TcpWindowAutoTuning.ForeColor = $ColorPrimary
+$lbl_TcpWindowAutoTuning.Text    = "TCP Window Auto-Tuning:"
+
+$cb_TcpWindowAutoTuning          = New-Object system.Windows.Forms.ComboBox
+$cb_TcpWindowAutoTuning.width    = 120
+$cb_TcpWindowAutoTuning.height   = 22
+@('disabled','normal','restricted','highlyrestricted','experimental') | ForEach-Object {[void]$cb_TcpWindowAutoTuning.Items.Add($_)}
+$cb_TcpWindowAutoTuning.location = New-Object System.Drawing.Point(200,52)
+$cb_TcpWindowAutoTuning.Font     = New-Object System.Drawing.Font('Calibri',10)
+$cb_TcpWindowAutoTuning.ForeColor= $ColorPrimary
+$cb_TcpWindowAutoTuning.BackColor= $ColorSurface
+
+$lbl_WindowsScalingHeuristics    = New-Object system.Windows.Forms.Label
+$lbl_WindowsScalingHeuristics.AutoSize = $true
+$lbl_WindowsScalingHeuristics.location = New-Object System.Drawing.Point(15,85)
+$lbl_WindowsScalingHeuristics.Font = New-Object System.Drawing.Font('Calibri',10)
+$lbl_WindowsScalingHeuristics.ForeColor = $ColorPrimary
+$lbl_WindowsScalingHeuristics.Text = "Windows Scaling heuristics:"
+
+$cb_WindowsScalingHeuristics     = New-Object system.Windows.Forms.ComboBox
+$cb_WindowsScalingHeuristics.width= 120
+$cb_WindowsScalingHeuristics.height= 22
+@('disabled','enabled') | ForEach-Object {[void]$cb_WindowsScalingHeuristics.Items.Add($_)}
+$cb_WindowsScalingHeuristics.location = New-Object System.Drawing.Point(200,82)
+$cb_WindowsScalingHeuristics.Font = New-Object System.Drawing.Font('Calibri',10)
+$cb_WindowsScalingHeuristics.ForeColor = $ColorPrimary
+$cb_WindowsScalingHeuristics.BackColor = $ColorSurface
+
+$lbl_CongestionControlProvider   = New-Object system.Windows.Forms.Label
+$lbl_CongestionControlProvider.AutoSize = $true
+$lbl_CongestionControlProvider.location = New-Object System.Drawing.Point(15,115)
+$lbl_CongestionControlProvider.Font = New-Object System.Drawing.Font('Calibri',10)
+$lbl_CongestionControlProvider.ForeColor = $ColorPrimary
+$lbl_CongestionControlProvider.Text = "Congestion Control Provider:"
+
+$cb_CongestionControlProvider    = New-Object system.Windows.Forms.ComboBox
+$cb_CongestionControlProvider.width = 120
+$cb_CongestionControlProvider.height = 22
+@('ctcp','cubic','newreno','none', 'default', 'dctcp', 'bbr', 'bbr2', 'ledbat', 'chd') | ForEach-Object {[void]$cb_CongestionControlProvider.Items.Add($_)}
+$cb_CongestionControlProvider.location = New-Object System.Drawing.Point(200,112)
+$cb_CongestionControlProvider.Font = New-Object System.Drawing.Font('Calibri',10)
+$cb_CongestionControlProvider.ForeColor = $ColorPrimary
+$cb_CongestionControlProvider.BackColor = $ColorSurface
+
+$lbl_ReceiveSideScaling          = New-Object system.Windows.Forms.Label
+$lbl_ReceiveSideScaling.AutoSize = $true
+$lbl_ReceiveSideScaling.location = New-Object System.Drawing.Point(15,145)
+$lbl_ReceiveSideScaling.Font     = New-Object System.Drawing.Font('Calibri',10)
+$lbl_ReceiveSideScaling.ForeColor= $ColorPrimary
+$lbl_ReceiveSideScaling.Text     = "Receive-Side Scaling (RSS):"
+
+$cb_ReceiveSideScaling           = New-Object system.Windows.Forms.ComboBox
+$cb_ReceiveSideScaling.width     = 120
+$cb_ReceiveSideScaling.height    = 22
+@('disabled','enabled') | ForEach-Object {[void]$cb_ReceiveSideScaling.Items.Add($_)}
+$cb_ReceiveSideScaling.location  = New-Object System.Drawing.Point(200,142)
+$cb_ReceiveSideScaling.Font      = New-Object System.Drawing.Font('Calibri',10)
+$cb_ReceiveSideScaling.ForeColor = $ColorPrimary
+$cb_ReceiveSideScaling.BackColor = $ColorSurface
+
+$lbl_Rsc                         = New-Object system.Windows.Forms.Label
+$lbl_Rsc.AutoSize                = $true
+$lbl_Rsc.location                = New-Object System.Drawing.Point(15,175)
+$lbl_Rsc.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$lbl_Rsc.ForeColor               = $ColorPrimary
+$lbl_Rsc.Text                    = "R.Segment Coalescing (RSC):"
+
+$cb_Rsc                          = New-Object system.Windows.Forms.ComboBox
+$cb_Rsc.width                    = 120
+$cb_Rsc.height                   = 22
+@('disabled','enabled') | ForEach-Object {[void]$cb_Rsc.Items.Add($_)}
+$cb_Rsc.location                 = New-Object System.Drawing.Point(200,172)
+$cb_Rsc.Font                     = New-Object System.Drawing.Font('Calibri',10)
+$cb_Rsc.ForeColor                = $ColorPrimary
+$cb_Rsc.BackColor                = $ColorSurface
+
+$lbl_Ttl                         = New-Object system.Windows.Forms.Label
+$lbl_Ttl.AutoSize                = $true
+$lbl_Ttl.location                = New-Object System.Drawing.Point(380,55)
+$lbl_Ttl.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$lbl_Ttl.ForeColor               = $ColorPrimary
+$lbl_Ttl.Text                    = "Time to Live (TTL):"
+
+$tb_Ttl                          = New-Object system.Windows.Forms.TextBox
+$tb_Ttl.multiline                = $false
+$tb_Ttl.width                    = 90
+$tb_Ttl.height                   = 22
+$tb_Ttl.location                 = New-Object System.Drawing.Point(530,52)
+$tb_Ttl.Font                     = New-Object System.Drawing.Font('Calibri',10)
+$tb_Ttl.ForeColor                = $ColorPrimary
+$tb_Ttl.BackColor                = $ColorSurface
+
+$lbl_EcnCapability               = New-Object system.Windows.Forms.Label
+$lbl_EcnCapability.AutoSize      = $true
+$lbl_EcnCapability.location      = New-Object System.Drawing.Point(380,85)
+$lbl_EcnCapability.Font          = New-Object System.Drawing.Font('Calibri',10)
+$lbl_EcnCapability.ForeColor     = $ColorPrimary
+$lbl_EcnCapability.Text          = "ECN Capability:"
+
+$cb_EcnCapability                = New-Object system.Windows.Forms.ComboBox
+$cb_EcnCapability.width          = 120
+$cb_EcnCapability.height         = 22
+@('disabled','enabled','default') | ForEach-Object {[void]$cb_EcnCapability.Items.Add($_)}
+$cb_EcnCapability.location       = New-Object System.Drawing.Point(530,82)
+$cb_EcnCapability.Font           = New-Object System.Drawing.Font('Calibri',10)
+$cb_EcnCapability.ForeColor      = $ColorPrimary
+$cb_EcnCapability.BackColor      = $ColorSurface
+
+$lbl_ChecksumOffloading          = New-Object system.Windows.Forms.Label
+$lbl_ChecksumOffloading.AutoSize = $true
+$lbl_ChecksumOffloading.location = New-Object System.Drawing.Point(380,115)
+$lbl_ChecksumOffloading.Font     = New-Object System.Drawing.Font('Calibri',10)
+$lbl_ChecksumOffloading.ForeColor= $ColorPrimary
+$lbl_ChecksumOffloading.Text     = "Checksum Offloading:"
+
+$cb_ChecksumOffloading           = New-Object system.Windows.Forms.ComboBox
+$cb_ChecksumOffloading.width     = 120
+$cb_ChecksumOffloading.height    = 22
+@('disabled','enabled') | ForEach-Object {[void]$cb_ChecksumOffloading.Items.Add($_)}
+$cb_ChecksumOffloading.location  = New-Object System.Drawing.Point(530,112)
+$cb_ChecksumOffloading.Font      = New-Object System.Drawing.Font('Calibri',10)
+$cb_ChecksumOffloading.ForeColor = $ColorPrimary
+$cb_ChecksumOffloading.BackColor = $ColorSurface
+
+$lbl_TcpChimney                  = New-Object system.Windows.Forms.Label
+$lbl_TcpChimney.AutoSize         = $true
+$lbl_TcpChimney.location         = New-Object System.Drawing.Point(380,145)
+$lbl_TcpChimney.Font             = New-Object System.Drawing.Font('Calibri',10)
+$lbl_TcpChimney.ForeColor        = $ColorPrimary
+$lbl_TcpChimney.Text             = "TCP Chimney Offload:"
+
+$cb_TcpChimney                   = New-Object system.Windows.Forms.ComboBox
+$cb_TcpChimney.width             = 120
+$cb_TcpChimney.height            = 22
+@('disabled','enabled','default') | ForEach-Object {[void]$cb_TcpChimney.Items.Add($_)}
+$cb_TcpChimney.location          = New-Object System.Drawing.Point(530,142)
+$cb_TcpChimney.Font              = New-Object System.Drawing.Font('Calibri',10)
+$cb_TcpChimney.ForeColor         = $ColorPrimary
+$cb_TcpChimney.BackColor         = $ColorSurface
+
+$lbl_Lso                         = New-Object system.Windows.Forms.Label
+$lbl_Lso.AutoSize                = $true
+$lbl_Lso.location                = New-Object System.Drawing.Point(380,175)
+$lbl_Lso.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$lbl_Lso.ForeColor               = $ColorPrimary
+$lbl_Lso.Text                    = "Large Send Offload (LSO):"
+
+$cb_Lso                          = New-Object system.Windows.Forms.ComboBox
+$cb_Lso.width                    = 120
+$cb_Lso.height                   = 22
+@('disabled','enabled') | ForEach-Object {[void]$cb_Lso.Items.Add($_)}
+$cb_Lso.location                 = New-Object System.Drawing.Point(530,172)
+$cb_Lso.Font                     = New-Object System.Drawing.Font('Calibri',10)
+$cb_Lso.ForeColor                = $ColorPrimary
+$cb_Lso.BackColor                = $ColorSurface
+
+$lbl_Tcp1323Timestamps           = New-Object system.Windows.Forms.Label
+$lbl_Tcp1323Timestamps.AutoSize  = $true
+$lbl_Tcp1323Timestamps.location  = New-Object System.Drawing.Point(380,205)
+$lbl_Tcp1323Timestamps.Font      = New-Object System.Drawing.Font('Calibri',10)
+$lbl_Tcp1323Timestamps.ForeColor = $ColorPrimary
+$lbl_Tcp1323Timestamps.Text      = "TCP 1323 Timestamps:"
+
+$cb_Tcp1323Timestamps            = New-Object system.Windows.Forms.ComboBox
+$cb_Tcp1323Timestamps.width      = 120
+$cb_Tcp1323Timestamps.height     = 22
+@('disabled','enabled') | ForEach-Object {[void]$cb_Tcp1323Timestamps.Items.Add($_)}
+$cb_Tcp1323Timestamps.location   = New-Object System.Drawing.Point(530,202)
+$cb_Tcp1323Timestamps.Font       = New-Object System.Drawing.Font('Calibri',10)
+$cb_Tcp1323Timestamps.ForeColor  = $ColorPrimary
+$cb_Tcp1323Timestamps.BackColor  = $ColorSurface
+
+$lbl_IEOptimization              = New-Object system.Windows.Forms.Label
+$lbl_IEOptimization.AutoSize     = $true
+$lbl_IEOptimization.location     = New-Object System.Drawing.Point(15,215)
+$lbl_IEOptimization.Font         = New-Object System.Drawing.Font('Calibri',10,[System.Drawing.FontStyle]::Bold)
+$lbl_IEOptimization.ForeColor    = $ColorPrimary
+$lbl_IEOptimization.Text         = "Internet Explorer Optimization"
+
+$lbl_MaxConnectionsPer10         = New-Object system.Windows.Forms.Label
+$lbl_MaxConnectionsPer10.AutoSize= $true
+$lbl_MaxConnectionsPer10.location= New-Object System.Drawing.Point(15,240)
+$lbl_MaxConnectionsPer10.Font    = New-Object System.Drawing.Font('Calibri',10)
+$lbl_MaxConnectionsPer10.ForeColor= $ColorPrimary
+$lbl_MaxConnectionsPer10.Text    = "MaxConnectionsPer1_0Server:"
+
+$tb_MaxConnectionsPer10          = New-Object system.Windows.Forms.TextBox
+$tb_MaxConnectionsPer10.multiline= $false
+$tb_MaxConnectionsPer10.width    = 80
+$tb_MaxConnectionsPer10.height   = 22
+$tb_MaxConnectionsPer10.location = New-Object System.Drawing.Point(200,237)
+$tb_MaxConnectionsPer10.Font     = New-Object System.Drawing.Font('Calibri',10)
+$tb_MaxConnectionsPer10.ForeColor= $ColorPrimary
+$tb_MaxConnectionsPer10.BackColor= $ColorSurface
+
+$lbl_MaxConnectionsPerServer     = New-Object system.Windows.Forms.Label
+$lbl_MaxConnectionsPerServer.AutoSize = $true
+$lbl_MaxConnectionsPerServer.location = New-Object System.Drawing.Point(15,270)
+$lbl_MaxConnectionsPerServer.Font = New-Object System.Drawing.Font('Calibri',10)
+$lbl_MaxConnectionsPerServer.ForeColor = $ColorPrimary
+$lbl_MaxConnectionsPerServer.Text = "MaxConnectionsPerServer:"
+
+$tb_MaxConnectionsPerServer      = New-Object system.Windows.Forms.TextBox
+$tb_MaxConnectionsPerServer.multiline = $false
+$tb_MaxConnectionsPerServer.width = 80
+$tb_MaxConnectionsPerServer.height = 22
+$tb_MaxConnectionsPerServer.location = New-Object System.Drawing.Point(200,267)
+$tb_MaxConnectionsPerServer.Font  = New-Object System.Drawing.Font('Calibri',10)
+$tb_MaxConnectionsPerServer.ForeColor = $ColorPrimary
+$tb_MaxConnectionsPerServer.BackColor = $ColorSurface
+
+$lbl_HostResolutionPriority      = New-Object system.Windows.Forms.Label
+$lbl_HostResolutionPriority.AutoSize = $true
+$lbl_HostResolutionPriority.location = New-Object System.Drawing.Point(15,300)
+$lbl_HostResolutionPriority.Font  = New-Object System.Drawing.Font('Calibri',10,[System.Drawing.FontStyle]::Bold)
+$lbl_HostResolutionPriority.ForeColor = $ColorPrimary
+$lbl_HostResolutionPriority.Text  = "Host Resolution Priority"
+
+$lbl_LocalPriority               = New-Object system.Windows.Forms.Label
+$lbl_LocalPriority.AutoSize      = $true
+$lbl_LocalPriority.location      = New-Object System.Drawing.Point(15,325)
+$lbl_LocalPriority.Font          = New-Object System.Drawing.Font('Calibri',10)
+$lbl_LocalPriority.ForeColor     = $ColorPrimary
+$lbl_LocalPriority.Text          = "LocalPriority:"
+
+$tb_LocalPriority                = New-Object system.Windows.Forms.TextBox
+$tb_LocalPriority.multiline      = $false
+$tb_LocalPriority.width          = 80
+$tb_LocalPriority.height         = 22
+$tb_LocalPriority.location       = New-Object System.Drawing.Point(200,322)
+$tb_LocalPriority.Font           = New-Object System.Drawing.Font('Calibri',10)
+$tb_LocalPriority.ForeColor      = $ColorPrimary
+$tb_LocalPriority.BackColor      = $ColorSurface
+
+$lbl_HostPriority                = New-Object system.Windows.Forms.Label
+$lbl_HostPriority.AutoSize       = $true
+$lbl_HostPriority.location       = New-Object System.Drawing.Point(15,355)
+$lbl_HostPriority.Font           = New-Object System.Drawing.Font('Calibri',10)
+$lbl_HostPriority.ForeColor      = $ColorPrimary
+$lbl_HostPriority.Text           = "HostPriority:"
+
+$tb_HostPriority                 = New-Object system.Windows.Forms.TextBox
+$tb_HostPriority.multiline       = $false
+$tb_HostPriority.width           = 80
+$tb_HostPriority.height          = 22
+$tb_HostPriority.location        = New-Object System.Drawing.Point(200,352)
+$tb_HostPriority.Font            = New-Object System.Drawing.Font('Calibri',10)
+$tb_HostPriority.ForeColor       = $ColorPrimary
+$tb_HostPriority.BackColor       = $ColorSurface
+
+$lbl_DnsPriority                 = New-Object system.Windows.Forms.Label
+$lbl_DnsPriority.AutoSize        = $true
+$lbl_DnsPriority.location        = New-Object System.Drawing.Point(15,385)
+$lbl_DnsPriority.Font            = New-Object System.Drawing.Font('Calibri',10)
+$lbl_DnsPriority.ForeColor       = $ColorPrimary
+$lbl_DnsPriority.Text            = "DnsPriority:"
+
+$tb_DnsPriority                  = New-Object system.Windows.Forms.TextBox
+$tb_DnsPriority.multiline        = $false
+$tb_DnsPriority.width            = 80
+$tb_DnsPriority.height           = 22
+$tb_DnsPriority.location         = New-Object System.Drawing.Point(200,382)
+$tb_DnsPriority.Font             = New-Object System.Drawing.Font('Calibri',10)
+$tb_DnsPriority.ForeColor        = $ColorPrimary
+$tb_DnsPriority.BackColor        = $ColorSurface
+
+$lbl_NetbtPriority               = New-Object system.Windows.Forms.Label
+$lbl_NetbtPriority.AutoSize      = $true
+$lbl_NetbtPriority.location      = New-Object System.Drawing.Point(15,415)
+$lbl_NetbtPriority.Font          = New-Object System.Drawing.Font('Calibri',10)
+$lbl_NetbtPriority.ForeColor     = $ColorPrimary
+$lbl_NetbtPriority.Text          = "NetbtPriority:"
+
+$tb_NetbtPriority                = New-Object system.Windows.Forms.TextBox
+$tb_NetbtPriority.multiline      = $false
+$tb_NetbtPriority.width          = 80
+$tb_NetbtPriority.height         = 22
+$tb_NetbtPriority.location       = New-Object System.Drawing.Point(200,412)
+$tb_NetbtPriority.Font           = New-Object System.Drawing.Font('Calibri',10)
+$tb_NetbtPriority.ForeColor      = $ColorPrimary
+$tb_NetbtPriority.BackColor      = $ColorSurface
+
+$lbl_MaxSynRetransmissions       = New-Object system.Windows.Forms.Label
+$lbl_MaxSynRetransmissions.AutoSize = $true
+$lbl_MaxSynRetransmissions.location = New-Object System.Drawing.Point(15,445)
+$lbl_MaxSynRetransmissions.Font  = New-Object System.Drawing.Font('Calibri',10)
+$lbl_MaxSynRetransmissions.ForeColor = $ColorPrimary
+$lbl_MaxSynRetransmissions.Text  = "Max SYN Retransmissions:"
+
+$tb_MaxSynRetransmissions        = New-Object system.Windows.Forms.TextBox
+$tb_MaxSynRetransmissions.multiline = $false
+$tb_MaxSynRetransmissions.width  = 80
+$tb_MaxSynRetransmissions.height = 22
+$tb_MaxSynRetransmissions.location = New-Object System.Drawing.Point(200,442)
+$tb_MaxSynRetransmissions.Font   = New-Object System.Drawing.Font('Calibri',10)
+$tb_MaxSynRetransmissions.ForeColor = $ColorPrimary
+$tb_MaxSynRetransmissions.BackColor = $ColorSurface
+
+$lbl_NonSackRttResiliency        = New-Object system.Windows.Forms.Label
+$lbl_NonSackRttResiliency.AutoSize = $true
+$lbl_NonSackRttResiliency.location = New-Object System.Drawing.Point(15,475)
+$lbl_NonSackRttResiliency.Font   = New-Object System.Drawing.Font('Calibri',10)
+$lbl_NonSackRttResiliency.ForeColor = $ColorPrimary
+$lbl_NonSackRttResiliency.Text   = "NonSackRttResiliency:"
+
+$cb_NonSackRttResiliency         = New-Object system.Windows.Forms.ComboBox
+$cb_NonSackRttResiliency.width   = 120
+$cb_NonSackRttResiliency.height  = 24
+@('disabled','enabled') | ForEach-Object {[void]$cb_NonSackRttResiliency.Items.Add($_)}
+$cb_NonSackRttResiliency.location = New-Object System.Drawing.Point(200,472)
+$cb_NonSackRttResiliency.Font    = New-Object System.Drawing.Font('Calibri',10)
+$cb_NonSackRttResiliency.ForeColor = $ColorPrimary
+$cb_NonSackRttResiliency.BackColor = $ColorSurface
+
+$lbl_RtoHeader                   = New-Object system.Windows.Forms.Label
+$lbl_RtoHeader.AutoSize          = $true
+$lbl_RtoHeader.location          = New-Object System.Drawing.Point(15,505)
+$lbl_RtoHeader.Font              = New-Object System.Drawing.Font('Calibri',10,[System.Drawing.FontStyle]::Bold)
+$lbl_RtoHeader.ForeColor         = $ColorPrimary
+$lbl_RtoHeader.Text              = "Retransmit Timeout (RTO)"
+
+$lbl_InitialRto                  = New-Object system.Windows.Forms.Label
+$lbl_InitialRto.AutoSize         = $true
+$lbl_InitialRto.location         = New-Object System.Drawing.Point(15,530)
+$lbl_InitialRto.Font             = New-Object System.Drawing.Font('Calibri',10)
+$lbl_InitialRto.ForeColor        = $ColorPrimary
+$lbl_InitialRto.Text             = "Initial RTO:"
+
+$tb_InitialRto                   = New-Object system.Windows.Forms.TextBox
+$tb_InitialRto.multiline         = $false
+$tb_InitialRto.width             = 80
+$tb_InitialRto.height            = 22
+$tb_InitialRto.location          = New-Object System.Drawing.Point(200,527)
+$tb_InitialRto.Font              = New-Object System.Drawing.Font('Calibri',10)
+$tb_InitialRto.ForeColor         = $ColorPrimary
+$tb_InitialRto.BackColor         = $ColorSurface
+
+$lbl_MinRto                      = New-Object system.Windows.Forms.Label
+$lbl_MinRto.AutoSize             = $true
+$lbl_MinRto.location             = New-Object System.Drawing.Point(15,560)
+$lbl_MinRto.Font                 = New-Object System.Drawing.Font('Calibri',10)
+$lbl_MinRto.ForeColor            = $ColorPrimary
+$lbl_MinRto.Text                 = "Min RTO:"
+
+$tb_MinRto                       = New-Object system.Windows.Forms.TextBox
+$tb_MinRto.multiline             = $false
+$tb_MinRto.width                 = 80
+$tb_MinRto.height                = 22
+$tb_MinRto.location              = New-Object System.Drawing.Point(200,557)
+$tb_MinRto.Font                  = New-Object System.Drawing.Font('Calibri',10)
+$tb_MinRto.ForeColor             = $ColorPrimary
+$tb_MinRto.BackColor             = $ColorSurface
+
+$lbl_TypeQualityService          = New-Object system.Windows.Forms.Label
+$lbl_TypeQualityService.AutoSize = $true
+$lbl_TypeQualityService.location = New-Object System.Drawing.Point(380,235)
+$lbl_TypeQualityService.Font     = New-Object System.Drawing.Font('Calibri',10,[System.Drawing.FontStyle]::Bold)
+$lbl_TypeQualityService.ForeColor = $ColorPrimary
+$lbl_TypeQualityService.Text     = "Type/Quality of Service"
+
+$lbl_QosNonBestEffort            = New-Object system.Windows.Forms.Label
+$lbl_QosNonBestEffort.AutoSize   = $true
+$lbl_QosNonBestEffort.location   = New-Object System.Drawing.Point(380,260)
+$lbl_QosNonBestEffort.Font       = New-Object System.Drawing.Font('Calibri',10)
+$lbl_QosNonBestEffort.ForeColor  = $ColorPrimary
+$lbl_QosNonBestEffort.Text       = "QoS: NonBestEffortLimit:"
+
+$tb_QosNonBestEffort             = New-Object system.Windows.Forms.TextBox
+$tb_QosNonBestEffort.multiline   = $false
+$tb_QosNonBestEffort.width       = 100
+$tb_QosNonBestEffort.height      = 22
+$tb_QosNonBestEffort.location    = New-Object System.Drawing.Point(530,257)
+$tb_QosNonBestEffort.Font        = New-Object System.Drawing.Font('Calibri',10)
+$tb_QosNonBestEffort.ForeColor   = $ColorPrimary
+$tb_QosNonBestEffort.BackColor   = $ColorSurface
+
+$lbl_QosNla                      = New-Object system.Windows.Forms.Label
+$lbl_QosNla.AutoSize             = $true
+$lbl_QosNla.location             = New-Object System.Drawing.Point(380,290)
+$lbl_QosNla.Font                 = New-Object System.Drawing.Font('Calibri',10)
+$lbl_QosNla.ForeColor            = $ColorPrimary
+$lbl_QosNla.Text                 = "QoS: Do not use NLA:"
+
+$cb_QosNla                       = New-Object system.Windows.Forms.ComboBox
+$cb_QosNla.width                 = 120
+$cb_QosNla.height                = 22
+@('disabled','enabled') | ForEach-Object {[void]$cb_QosNla.Items.Add($_)}
+$cb_QosNla.location              = New-Object System.Drawing.Point(530,287)
+$cb_QosNla.Font                  = New-Object System.Drawing.Font('Calibri',10)
+$cb_QosNla.ForeColor             = $ColorPrimary
+$cb_QosNla.BackColor             = $ColorSurface
+
+$lbl_NetworkThrottleHeader       = New-Object system.Windows.Forms.Label
+$lbl_NetworkThrottleHeader.AutoSize = $true
+$lbl_NetworkThrottleHeader.location = New-Object System.Drawing.Point(380,320)
+$lbl_NetworkThrottleHeader.Font  = New-Object System.Drawing.Font('Calibri',10,[System.Drawing.FontStyle]::Bold)
+$lbl_NetworkThrottleHeader.ForeColor = $ColorPrimary
+$lbl_NetworkThrottleHeader.Text  = "Gaming Tweak - Network Throttling"
+
+$lbl_NetworkThrottlingIndex      = New-Object system.Windows.Forms.Label
+$lbl_NetworkThrottlingIndex.AutoSize = $true
+$lbl_NetworkThrottlingIndex.location = New-Object System.Drawing.Point(380,345)
+$lbl_NetworkThrottlingIndex.Font = New-Object System.Drawing.Font('Calibri',10)
+$lbl_NetworkThrottlingIndex.ForeColor = $ColorPrimary
+$lbl_NetworkThrottlingIndex.Text = "NetworkThrottlingIndex:"
+
+$tb_NetworkThrottlingIndex       = New-Object system.Windows.Forms.TextBox
+$tb_NetworkThrottlingIndex.multiline = $false
+$tb_NetworkThrottlingIndex.width = 120
+$tb_NetworkThrottlingIndex.height = 22
+$tb_NetworkThrottlingIndex.location = New-Object System.Drawing.Point(530,342)
+$tb_NetworkThrottlingIndex.Font  = New-Object System.Drawing.Font('Calibri',10)
+$tb_NetworkThrottlingIndex.ForeColor = $ColorPrimary
+$tb_NetworkThrottlingIndex.BackColor = $ColorSurface
+
+$lbl_DisableNagleHeader          = New-Object system.Windows.Forms.Label
+$lbl_DisableNagleHeader.AutoSize = $true
+$lbl_DisableNagleHeader.location = New-Object System.Drawing.Point(380,375)
+$lbl_DisableNagleHeader.Font     = New-Object System.Drawing.Font('Calibri',10,[System.Drawing.FontStyle]::Bold)
+$lbl_DisableNagleHeader.ForeColor = $ColorPrimary
+$lbl_DisableNagleHeader.Text     = "Gaming Tweak - Disable Nagle's algorithm"
+
+$lbl_TcpAckFrequency             = New-Object system.Windows.Forms.Label
+$lbl_TcpAckFrequency.AutoSize    = $true
+$lbl_TcpAckFrequency.location    = New-Object System.Drawing.Point(380,400)
+$lbl_TcpAckFrequency.Font        = New-Object System.Drawing.Font('Calibri',10)
+$lbl_TcpAckFrequency.ForeColor   = $ColorPrimary
+$lbl_TcpAckFrequency.Text        = "TCPAckFrequency:"
+
+$cb_TcpAckFrequency              = New-Object system.Windows.Forms.ComboBox
+$cb_TcpAckFrequency.width        = 120
+$cb_TcpAckFrequency.height       = 22
+$cb_TcpAckFrequency.location     = New-Object System.Drawing.Point(530,397)
+$cb_TcpAckFrequency.Font         = New-Object System.Drawing.Font('Calibri',10)
+$cb_TcpAckFrequency.ForeColor    = $ColorPrimary
+$cb_TcpAckFrequency.BackColor    = $ColorSurface
+
+$cb_TcpAckFrequency.Items.Add("default: n/a")
+$cb_TcpAckFrequency.Items.Add("disabled: 1")
+$cb_TcpAckFrequency.Items.Add("enable: 2")
+$cb_TcpAckFrequency.Items.Add("enabl: 3")
+$cb_TcpAckFrequency.Items.Add("enable: 4")
+$groupbox9.Controls.Add($cb_TcpAckFrequency)
+
+$lbl_TcpNoDelay                  = New-Object system.Windows.Forms.Label
+$lbl_TcpNoDelay.AutoSize         = $true
+$lbl_TcpNoDelay.location         = New-Object System.Drawing.Point(380,430)
+$lbl_TcpNoDelay.Font             = New-Object System.Drawing.Font('Calibri',10)
+$lbl_TcpNoDelay.ForeColor        = $ColorPrimary
+$lbl_TcpNoDelay.Text             = "TCPNoDelay:"
+
+$cb_TcpNoDelay                   = New-Object system.Windows.Forms.ComboBox
+$cb_TcpNoDelay.width             = 120
+$cb_TcpNoDelay.height            = 22
+$cb_TcpNoDelay.location          = New-Object System.Drawing.Point(530,427)
+$cb_TcpNoDelay.Font              = New-Object System.Drawing.Font('Calibri',10)
+$cb_TcpNoDelay.ForeColor         = $ColorPrimary
+$cb_TcpNoDelay.BackColor         = $ColorSurface
+
+$cb_TcpNoDelay.Items.Add("default: n/a")
+$cb_TcpNoDelay.Items.Add("disabled: 0")
+$cb_TcpNoDelay.Items.Add("enable: 1")
+$groupbox9.Controls.Add($cb_TcpNoDelay)
+
+# --- TcpDelAckTicks -----------------------------------------------------
+$lbl_TcpDelAckTicks                      = New-Object system.Windows.Forms.Label
+$lbl_TcpDelAckTicks.Text                 = "TcpDelAckTicks:"
+$lbl_TcpDelAckTicks.AutoSize             = $true
+$lbl_TcpDelAckTicks.Font                 = New-Object System.Drawing.Font('Calibri',10)
+$lbl_TcpDelAckTicks.ForeColor            = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$lbl_TcpDelAckTicks.Location             = New-Object System.Drawing.Point(380,460)
+$groupbox9.Controls.Add($lbl_TcpDelAckTicks)
+
+$cb_TcpDelAckTicks                      = New-Object System.Windows.Forms.ComboBox
+$cb_TcpDelAckTicks.Width                = 120
+$cb_TcpDelAckTicks.height               = 22
+$cb_TcpDelAckTicks.Font                 = New-Object System.Drawing.Font('Calibri',10)
+$cb_TcpDelAckTicks.Location             = New-Object System.Drawing.Point(530,457)
+$cb_TcpDelAckTicks.ForeColor            = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_TcpDelAckTicks.BackColor            = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+# valori tipici per TcpDelAckTicks
+$cb_TcpDelAckTicks.Items.Add("disabled: 0")
+$cb_TcpDelAckTicks.Items.Add("100ms")
+$cb_TcpDelAckTicks.Items.Add("200ms")
+$cb_TcpDelAckTicks.Items.Add("300ms")
+$cb_TcpDelAckTicks.Items.Add("400ms")
+$groupbox9.Controls.Add($cb_TcpDelAckTicks)
+
+<# $lbl_NetworkMemoryAllocation     = New-Object system.Windows.Forms.Label
+$lbl_NetworkMemoryAllocation.AutoSize = $true
+$lbl_NetworkMemoryAllocation.location = New-Object System.Drawing.Point(380,460)
+$lbl_NetworkMemoryAllocation.Font = New-Object System.Drawing.Font('Calibri',10,[System.Drawing.FontStyle]::Bold)
+$lbl_NetworkMemoryAllocation.ForeColor = $ColorPrimary
+$lbl_NetworkMemoryAllocation.Text = "Network Memory Allocation" #>
+
+$lbl_LargeSystemCache            = New-Object system.Windows.Forms.Label
+$lbl_LargeSystemCache.AutoSize   = $true
+$lbl_LargeSystemCache.location   = New-Object System.Drawing.Point(380,485)
+$lbl_LargeSystemCache.Font       = New-Object System.Drawing.Font('Calibri',10)
+$lbl_LargeSystemCache.ForeColor  = $ColorPrimary
+$lbl_LargeSystemCache.Text       = "LargeSystemCache:"
+
+$cb_LargeSystemCache             = New-Object system.Windows.Forms.ComboBox
+$cb_LargeSystemCache.width       = 120
+$cb_LargeSystemCache.height      = 24
+@('0','1') | ForEach-Object {[void]$cb_LargeSystemCache.Items.Add($_)}
+$cb_LargeSystemCache.location    = New-Object System.Drawing.Point(530,482)
+$cb_LargeSystemCache.Font        = New-Object System.Drawing.Font('Calibri',10)
+$cb_LargeSystemCache.ForeColor   = $ColorPrimary
+$cb_LargeSystemCache.BackColor   = $ColorSurface
+
+$lbl_DynamicPortAllocation       = New-Object system.Windows.Forms.Label
+$lbl_DynamicPortAllocation.AutoSize = $true
+$lbl_DynamicPortAllocation.location = New-Object System.Drawing.Point(380,515)
+$lbl_DynamicPortAllocation.Font  = New-Object System.Drawing.Font('Calibri',10,[System.Drawing.FontStyle]::Bold)
+$lbl_DynamicPortAllocation.ForeColor = $ColorPrimary
+$lbl_DynamicPortAllocation.Text  = "Dynamic Port Allocation"
+
+$lbl_MaxUserPort                 = New-Object system.Windows.Forms.Label
+$lbl_MaxUserPort.AutoSize        = $true
+$lbl_MaxUserPort.location        = New-Object System.Drawing.Point(380,540)
+$lbl_MaxUserPort.Font            = New-Object System.Drawing.Font('Calibri',10)
+$lbl_MaxUserPort.ForeColor       = $ColorPrimary
+$lbl_MaxUserPort.Text            = "MaxUserPort:"
+
+$tb_MaxUserPort                  = New-Object system.Windows.Forms.TextBox
+$tb_MaxUserPort.multiline        = $false
+$tb_MaxUserPort.width            = 120
+$tb_MaxUserPort.height           = 22
+$tb_MaxUserPort.location         = New-Object System.Drawing.Point(530,537)
+$tb_MaxUserPort.Font             = New-Object System.Drawing.Font('Calibri',10)
+$tb_MaxUserPort.ForeColor        = $ColorPrimary
+$tb_MaxUserPort.BackColor        = $ColorSurface
+
+$lbl_TcpTimedWaitDelay           = New-Object system.Windows.Forms.Label
+$lbl_TcpTimedWaitDelay.AutoSize  = $true
+$lbl_TcpTimedWaitDelay.location  = New-Object System.Drawing.Point(380,570)
+$lbl_TcpTimedWaitDelay.Font      = New-Object System.Drawing.Font('Calibri',10)
+$lbl_TcpTimedWaitDelay.ForeColor = $ColorPrimary
+$lbl_TcpTimedWaitDelay.Text      = "TcpTimedWaitDelay:"
+
+$tb_TcpTimedWaitDelay            = New-Object system.Windows.Forms.TextBox
+$tb_TcpTimedWaitDelay.multiline  = $false
+$tb_TcpTimedWaitDelay.width      = 120
+$tb_TcpTimedWaitDelay.height     = 22
+$tb_TcpTimedWaitDelay.location   = New-Object System.Drawing.Point(530,567)
+$tb_TcpTimedWaitDelay.Font       = New-Object System.Drawing.Font('Calibri',10)
+$tb_TcpTimedWaitDelay.ForeColor  = $ColorPrimary
+$tb_TcpTimedWaitDelay.BackColor  = $ColorSurface
+
+$btn_TcpSafe                     = New-Object system.Windows.Forms.Button
+$btn_TcpSafe.text                = "Preset: SAFE"
+$btn_TcpSafe.width               = 200
+$btn_TcpSafe.height              = 28
+$btn_TcpSafe.location            = New-Object System.Drawing.Point(15,600)
+$btn_TcpSafe.Font                = New-Object System.Drawing.Font('Calibri',10)
+$btn_TcpSafe.ForeColor           = $ColorActionText
+$btn_TcpSafe.BackColor           = $ColorQuickPreset
+
+$btn_TcpBalanced                 = New-Object system.Windows.Forms.Button
+$btn_TcpBalanced.text            = "Preset: BALANCED"
+$btn_TcpBalanced.width           = 200
+$btn_TcpBalanced.height          = 28
+$btn_TcpBalanced.location        = New-Object System.Drawing.Point(270,600)
+$btn_TcpBalanced.Font            = New-Object System.Drawing.Font('Calibri',10)
+$btn_TcpBalanced.ForeColor       = $ColorActionText
+$btn_TcpBalanced.BackColor       = $ColorQuickPreset
+
+$btn_TcpAggressive               = New-Object system.Windows.Forms.Button
+$btn_TcpAggressive.text          = "Preset: AGGRESSIVE"
+$btn_TcpAggressive.width         = 200
+$btn_TcpAggressive.height        = 28
+$btn_TcpAggressive.location      = New-Object System.Drawing.Point(15,635)
+$btn_TcpAggressive.Font          = New-Object System.Drawing.Font('Calibri',10)
+$btn_TcpAggressive.ForeColor     = $ColorActionText
+$btn_TcpAggressive.BackColor     = $ColorQuickPreset
+
+$btn_ToggleAutotune              = New-Object system.Windows.Forms.Button
+$btn_ToggleAutotune.text         = "Toggle Auto-Tuning"
+$btn_ToggleAutotune.width        = 200
+$btn_ToggleAutotune.height       = 28
+$btn_ToggleAutotune.location     = New-Object System.Drawing.Point(270,635)
+$btn_ToggleAutotune.Font         = New-Object System.Drawing.Font('Calibri',10)
+$btn_ToggleAutotune.ForeColor    = $ColorActionText
+$btn_ToggleAutotune.BackColor    = $ColorQuickAction
+
+$btn_IrqAffinityDialog               = New-Object system.Windows.Forms.Button
+$btn_IrqAffinityDialog.text          = "IRQ & Affinity"
+$btn_IrqAffinityDialog.width         = 200
+$btn_IrqAffinityDialog.height        = 28
+$btn_IrqAffinityDialog.location      = New-Object System.Drawing.Point(15,670)
+$btn_IrqAffinityDialog.Font          = New-Object System.Drawing.Font('Calibri',10,[System.Drawing.FontStyle]::Bold)
+$btn_IrqAffinityDialog.ForeColor     = $ColorActionText
+$btn_IrqAffinityDialog.BackColor     = $ColorQuickAction
+
+$btn_NicExtrasDialog               = New-Object system.Windows.Forms.Button
+$btn_NicExtrasDialog.text          = "NIC Extras"
+$btn_NicExtrasDialog.width         = 200
+$btn_NicExtrasDialog.height        = 28
+$btn_NicExtrasDialog.location      = New-Object System.Drawing.Point(270,670)
+$btn_NicExtrasDialog.Font          = New-Object System.Drawing.Font('Calibri',10,[System.Drawing.FontStyle]::Bold)
+$btn_NicExtrasDialog.ForeColor     = $ColorActionText
+$btn_NicExtrasDialog.BackColor     = $ColorQuickAction
+
+$btn_tcpOffloadApply = New-Object system.Windows.Forms.Button 
+$btn_tcpOffloadApply.text = "Apply" 
+$btn_tcpOffloadApply.width = 60 
+$btn_tcpOffloadApply.height = 21
+$btn_tcpOffloadApply.location = New-Object System.Drawing.Point(1365,818) 
+$btn_tcpOffloadApply.Font = New-Object System.Drawing.Font('Calibri',10) 
+$btn_tcpOffloadApply.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$btn_tcpOffloadApply.BringToFront()
+$btn_tcpOffloadApply.BackColor = $ColorSurface
+$btn_tcpOffloadApply.Flatstyle = 'Flat'
+
+# === Groupbox10: QoS ===
+$Groupbox10                       = New-Object system.Windows.Forms.Groupbox
+$Groupbox10.height                = 380
+$Groupbox10.width                 = 230
+$Groupbox10.text                  = "QoS"
+$Groupbox10.location              = New-Object System.Drawing.Point(10,610)
+$Groupbox10.Font                  = New-Object System.Drawing.Font('Calibri',10)
+$Groupbox10.ForeColor             = $ColorPrimary
+
+$lbl_QoS_Presets                  = New-Object system.Windows.Forms.Label
+$lbl_QoS_Presets.AutoSize         = $true
+$lbl_QoS_Presets.location         = New-Object System.Drawing.Point(15,25)
+$lbl_QoS_Presets.Font             = New-Object System.Drawing.Font('Calibri',10)
+$lbl_QoS_Presets.ForeColor        = $ColorPrimary
+$lbl_QoS_Presets.Text             = "Game presets"
+
+$cb_QoS_Preset                    = New-Object system.Windows.Forms.ComboBox
+$cb_QoS_Preset.width              = 200
+$cb_QoS_Preset.height             = 24
+$cb_QoS_Preset.location           = New-Object System.Drawing.Point(15,45)
+$cb_QoS_Preset.Font               = New-Object System.Drawing.Font('Calibri',10)
+$cb_QoS_Preset.ForeColor          = $ColorPrimary
+$cb_QoS_Preset.BackColor          = $ColorSurface
+foreach ($p in $Global:QoSGamePresets.Display) { [void]$cb_QoS_Preset.Items.Add($p) }
+$cb_QoS_Preset.SelectedIndex = 0
+
+$btn_QoS_BF6                      = New-Object system.Windows.Forms.Button
+$btn_QoS_BF6.text                 = "Apply preset"
+$btn_QoS_BF6.width                = 200
+$btn_QoS_BF6.height               = 28
+$btn_QoS_BF6.location             = New-Object System.Drawing.Point(15,75)
+$btn_QoS_BF6.Font                 = New-Object System.Drawing.Font('Calibri',10,[System.Drawing.FontStyle]::Bold)
+$btn_QoS_BF6.ForeColor            = $ColorActionText
+$btn_QoS_BF6.BackColor            = $ColorQuickPreset
+
+$btn_QoS_Multi                    = New-Object system.Windows.Forms.Button
+$btn_QoS_Multi.text               = "Apply All"
+$btn_QoS_Multi.width              = 200
+$btn_QoS_Multi.height             = 28
+$btn_QoS_Multi.location           = New-Object System.Drawing.Point(15,110)
+$btn_QoS_Multi.Font               = New-Object System.Drawing.Font('Calibri',10,[System.Drawing.FontStyle]::Bold)
+$btn_QoS_Multi.ForeColor          = $ColorActionText
+$btn_QoS_Multi.BackColor          = $ColorQuickAction
+
+$btn_QoS_Custom                   = New-Object system.Windows.Forms.Button
+$btn_QoS_Custom.text              = "Custom"
+$btn_QoS_Custom.width             = 95
+$btn_QoS_Custom.height            = 28
+$btn_QoS_Custom.location          = New-Object System.Drawing.Point(15,145)
+$btn_QoS_Custom.Font              = New-Object System.Drawing.Font('Calibri',10)
+$btn_QoS_Custom.ForeColor         = $ColorPrimary
+$btn_QoS_Custom.BackColor         = $ColorSurface
+
+$btn_QoS_Remove                   = New-Object system.Windows.Forms.Button
+$btn_QoS_Remove.text              = "Remove All"
+$btn_QoS_Remove.width             = 95
+$btn_QoS_Remove.height            = 28
+$btn_QoS_Remove.location          = New-Object System.Drawing.Point(120,145)
+$btn_QoS_Remove.Font              = New-Object System.Drawing.Font('Calibri',10)
+$btn_QoS_Remove.ForeColor         = $ColorPrimary
+$btn_QoS_Remove.BackColor         = $ColorSurface
+
+$btn_Security                     = New-Object system.Windows.Forms.Button
+$btn_Security.text                = "Security Center"
+$btn_Security.width               = 200
+$btn_Security.height              = 28
+$btn_Security.location            = New-Object System.Drawing.Point(15,180)
+$btn_Security.Font                = New-Object System.Drawing.Font('Calibri',10,[System.Drawing.FontStyle]::Bold)
+$btn_Security.ForeColor           = $ColorActionText
+$btn_Security.BackColor           = $ColorSecurity
+
+$lbl_QoS_List                     = New-Object system.Windows.Forms.Label
+$lbl_QoS_List.AutoSize            = $true
+$lbl_QoS_List.location            = New-Object System.Drawing.Point(15,220)
+$lbl_QoS_List.Font                = New-Object System.Drawing.Font('Calibri',10)
+$lbl_QoS_List.ForeColor           = $ColorPrimary
+$lbl_QoS_List.Text                = "Active policies (ActiveStore):"
+
+$lst_QoS                          = New-Object System.Windows.Forms.ListBox
+$lst_QoS.location                 = New-Object System.Drawing.Point(15,240)
+$lst_QoS.size                     = New-Object System.Drawing.Size(200,120)
+$lst_QoS.Font                     = New-Object System.Drawing.Font('Calibri',10)
+$lst_QoS.ForeColor                = $ColorPrimary
+$lst_QoS.BackColor                = $ColorSurface
+
+# === Groupbox11: NDIS & MMCSS ===
+$Groupbox11                       = New-Object system.Windows.Forms.Groupbox
+$Groupbox11.height                = 160
+$Groupbox11.width                 = 260
+$Groupbox11.text                  = "NDIS & MMCSS"
+$Groupbox11.location              = New-Object System.Drawing.Point(252,940)
+$Groupbox11.Font                  = New-Object System.Drawing.Font('Calibri',10)
+$Groupbox11.ForeColor             = $ColorPrimary
+
+$lbl_Mmcss                        = New-Object system.Windows.Forms.Label
+$lbl_Mmcss.AutoSize               = $true
+$lbl_Mmcss.location               = New-Object System.Drawing.Point(15,25)
+$lbl_Mmcss.Font                   = New-Object System.Drawing.Font('Calibri',10)
+$lbl_Mmcss.ForeColor              = $ColorPrimary
+$lbl_Mmcss.Text                   = Get-MmcssStatusText
+
+$btn_AckTweaks = New-Object System.Windows.Forms.Button
+$btn_AckTweaks.Text = "ACK Tweaks"
+$btn_AckTweaks.Size = New-Object System.Drawing.Size(230,28)
+$btn_AckTweaks.Location = New-Object System.Drawing.Point(15,45)
+$btn_AckTweaks.FlatStyle = 'Flat'
+$btn_AckTweaks.BackColor = $ColorQuickAction
+$btn_AckTweaks.ForeColor = $ColorActionText
+
+$btn_MmcssApply                   = New-Object system.Windows.Forms.Button
+$btn_MmcssApply.text              = "Apply Optimizations"
+$btn_MmcssApply.width             = 230
+$btn_MmcssApply.height            = 28
+$btn_MmcssApply.location          = New-Object System.Drawing.Point(15,80)
+$btn_MmcssApply.Font              = New-Object System.Drawing.Font('Calibri',10,[System.Drawing.FontStyle]::Bold)
+$btn_MmcssApply.ForeColor         = $ColorActionText
+$btn_MmcssApply.BackColor         = $ColorQuickPreset
+
+$btn_MmcssRevert                  = New-Object system.Windows.Forms.Button
+$btn_MmcssRevert.text             = "Revert"
+$btn_MmcssRevert.width            = 230
+$btn_MmcssRevert.height           = 28
+$btn_MmcssRevert.location         = New-Object System.Drawing.Point(15,115)
+$btn_MmcssRevert.Font             = New-Object System.Drawing.Font('Calibri',10)
+$btn_MmcssRevert.ForeColor        = $ColorPrimary
+$btn_MmcssRevert.BackColor        = $ColorSurface
+
+$Label43                         = New-Object system.Windows.Forms.Label
+$Label43.text                    = "DefaultReceiveWindow:"
+$Label43.AutoSize                = $true
+$Label43.width                   = 25
+$Label43.height                  = 10
+$Label43.location                = New-Object System.Drawing.Point(6,20)
+$Label43.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label43.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$Label77                         = New-Object system.Windows.Forms.Label
+$Label77.text                    = "DefaultSendWindow:"
+$Label77.AutoSize                = $true
+$Label77.width                   = 25
+$Label77.height                  = 10
+$Label77.location                = New-Object System.Drawing.Point(6,42)
+$Label77.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label77.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$btn_registrytweaksapply         = New-Object system.Windows.Forms.Button
+$btn_registrytweaksapply.text    = "Apply"
+$btn_registrytweaksapply.width   = 60
+$btn_registrytweaksapply.height  = 20
+$btn_registrytweaksapply.location  = New-Object System.Drawing.Point(976,682)
+$btn_registrytweaksapply.Font    = New-Object System.Drawing.Font('Calibri',10)
+$btn_registrytweaksapply.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_Afd_defaultrecWin            = New-Object system.Windows.Forms.ComboBox
+$cb_Afd_defaultrecWin.width      = 190
+$cb_Afd_defaultrecWin.height     = 20
+@('8192','32767') | ForEach-Object {[void] $cb_Afd_defaultrecWin.Items.Add($_)}
+$cb_Afd_defaultrecWin.location   = New-Object System.Drawing.Point(177,17)
+$cb_Afd_defaultrecWin.Font       = New-Object System.Drawing.Font('Calibri',9)
+$cb_Afd_defaultrecWin.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_Afd_defaultrecWin.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$cb_Afd_defaultSendWin           = New-Object system.Windows.Forms.ComboBox
+$cb_Afd_defaultSendWin.width     = 190
+$cb_Afd_defaultSendWin.height    = 20
+@('8192','32767') | ForEach-Object {[void] $cb_Afd_defaultSendWin.Items.Add($_)}
+$cb_Afd_defaultSendWin.location  = New-Object System.Drawing.Point(177,39)
+$cb_Afd_defaultSendWin.Font      = New-Object System.Drawing.Font('Calibri',9)
+$cb_Afd_defaultSendWin.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_Afd_defaultSendWin.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$btn_Opacity                     = New-Object system.Windows.Forms.Button
+$btn_Opacity.text                = "Opacity On/Off"
+$btn_Opacity.width               = 112
+$btn_Opacity.height              = 20
+$btn_Opacity.location            = New-Object System.Drawing.Point(628,16)
+$btn_Opacity.Font                = New-Object System.Drawing.Font('Calibri',10)
+$btn_Opacity.ForeColor           = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+# --- Backup buttons (same row, after Opacity) ---
+$refBtn  = $btn_openreg
+$btnSize = New-Object System.Drawing.Size(140, 24)
+$y       = $refBtn.Location.Y
+$startX  = $btn_Opacity.location.X + $btn_Opacity.width + 8
+
+function New-BackupButton($text,$x,$action) {
+    $btn = New-Object System.Windows.Forms.Button
+    $btn.Text      = $text
+    $btn.Size      = $btnSize
+    $btn.Font      = New-Object System.Drawing.Font('Calibri',10)   # uniforma il font
+    $btn.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+    $btn.Location  = New-Object System.Drawing.Point($x, $y)
+    $btn.FlatStyle = 'Flat'
+    $btn.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#FFC20A")
+    $btn.ForeColor = [System.Drawing.Color]::Black
+    $btn.Cursor    = [System.Windows.Forms.Cursors]::Hand
+    if ($action) { $btn.Add_Click($action) }
+    $Form.Controls.Add($btn)
+    return $btn
+}
+
+$btn_BackupSave    = New-BackupButton "Backup Save" $startX { Invoke-BackupSave }
+$btn_BackupRestore = New-BackupButton "Backup Restore" ($btn_BackupSave.Location.X + $btnSize.Width + 8) { Invoke-BackupRestore }
+$btn_RestorePoint  = New-BackupButton "Create Restore Point" ($btn_BackupRestore.Location.X + $btnSize.Width + 8) { Invoke-CreateRestorePoint }
+$btn_RegExport     = New-BackupButton "Backup Regedit" ($btn_RestorePoint.Location.X + $btnSize.Width + 8) { Invoke-RegistryBackup }
+
+$Label78                         = New-Object system.Windows.Forms.Label
+$Label78.text                    = "DisableAddressSharing:"
+$Label78.AutoSize                = $true
+$Label78.width                   = 25
+$Label78.height                  = 10
+$Label78.location                = New-Object System.Drawing.Point(5,284)
+$Label78.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label78.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_DisableAddressSharing        = New-Object system.Windows.Forms.ComboBox
+$cb_DisableAddressSharing.width  = 190
+$cb_DisableAddressSharing.height  = 20
+@('0','1') | ForEach-Object {[void] $cb_DisableAddressSharing.Items.Add($_)}
+$cb_DisableAddressSharing.location  = New-Object System.Drawing.Point(177,281)
+$cb_DisableAddressSharing.Font   = New-Object System.Drawing.Font('Calibri',9)
+$cb_DisableAddressSharing.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_DisableAddressSharing.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label79                         = New-Object system.Windows.Forms.Label
+$Label79.text                    = "DoNotHoldNICBuffers:"
+$Label79.AutoSize                = $true
+$Label79.width                   = 25
+$Label79.height                  = 10
+$Label79.location                = New-Object System.Drawing.Point(6,108)
+$Label79.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label79.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_DoNotHoldNICBuffers          = New-Object system.Windows.Forms.ComboBox
+$cb_DoNotHoldNICBuffers.width    = 190
+$cb_DoNotHoldNICBuffers.height   = 20
+@('0','1') | ForEach-Object {[void] $cb_DoNotHoldNICBuffers.Items.Add($_)}
+$cb_DoNotHoldNICBuffers.location  = New-Object System.Drawing.Point(177,105)
+$cb_DoNotHoldNICBuffers.Font     = New-Object System.Drawing.Font('Calibri',9)
+$cb_DoNotHoldNICBuffers.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_DoNotHoldNICBuffers.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label80                         = New-Object system.Windows.Forms.Label
+$Label80.text                    = "SmallBufferSize:"
+$Label80.AutoSize                = $true
+$Label80.width                   = 25
+$Label80.height                  = 10
+$Label80.location                = New-Object System.Drawing.Point(6,130)
+$Label80.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label80.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_SmallBufferSize              = New-Object system.Windows.Forms.ComboBox
+$cb_SmallBufferSize.width        = 190
+$cb_SmallBufferSize.height       = 20
+@('128') | ForEach-Object {[void] $cb_SmallBufferSize.Items.Add($_)}
+$cb_SmallBufferSize.location     = New-Object System.Drawing.Point(177,127)
+$cb_SmallBufferSize.Font         = New-Object System.Drawing.Font('Calibri',9)
+$cb_SmallBufferSize.ForeColor    = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_SmallBufferSize.BackColor    = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label81                         = New-Object system.Windows.Forms.Label
+$Label81.text                    = "MediumBufferSize:"
+$Label81.AutoSize                = $true
+$Label81.width                   = 25
+$Label81.height                  = 10
+$Label81.location                = New-Object System.Drawing.Point(6,152)
+$Label81.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label81.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_MediumBufferSize             = New-Object system.Windows.Forms.ComboBox
+$cb_MediumBufferSize.width       = 190
+$cb_MediumBufferSize.height      = 20
+@('1504') | ForEach-Object {[void] $cb_MediumBufferSize.Items.Add($_)}
+$cb_MediumBufferSize.location    = New-Object System.Drawing.Point(177,149)
+$cb_MediumBufferSize.Font        = New-Object System.Drawing.Font('Calibri',9)
+$cb_MediumBufferSize.ForeColor   = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_MediumBufferSize.BackColor   = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label82                         = New-Object system.Windows.Forms.Label
+$Label82.text                    = "LargeBufferSize:"
+$Label82.AutoSize                = $true
+$Label82.width                   = 25
+$Label82.height                  = 10
+$Label82.location                = New-Object System.Drawing.Point(6,174)
+$Label82.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label82.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_LargeBufferSize              = New-Object system.Windows.Forms.ComboBox
+$cb_LargeBufferSize.width        = 190
+$cb_LargeBufferSize.height       = 20
+@('3876') | ForEach-Object {[void] $cb_LargeBufferSize.Items.Add($_)}
+$cb_LargeBufferSize.location     = New-Object System.Drawing.Point(177,171)
+$cb_LargeBufferSize.Font         = New-Object System.Drawing.Font('Calibri',9)
+$cb_LargeBufferSize.ForeColor    = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_LargeBufferSize.BackColor    = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label83                         = New-Object system.Windows.Forms.Label
+$Label83.text                    = "HugeBufferSize:"
+$Label83.AutoSize                = $true
+$Label83.width                   = 25
+$Label83.height                  = 10
+$Label83.location                = New-Object System.Drawing.Point(6,196)
+$Label83.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label83.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_HugeBufferSize               = New-Object system.Windows.Forms.ComboBox
+$cb_HugeBufferSize.width         = 190
+$cb_HugeBufferSize.height        = 20
+$cb_HugeBufferSize.location      = New-Object System.Drawing.Point(177,193)
+$cb_HugeBufferSize.Font          = New-Object System.Drawing.Font('Calibri',9)
+$cb_HugeBufferSize.ForeColor     = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_HugeBufferSize.BackColor     = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$cb_BufferAlignment              = New-Object system.Windows.Forms.ComboBox
+$cb_BufferAlignment.width        = 190
+$cb_BufferAlignment.height       = 20
+@('1','0') | ForEach-Object {[void] $cb_BufferAlignment.Items.Add($_)}
+$cb_BufferAlignment.location     = New-Object System.Drawing.Point(177,83)
+$cb_BufferAlignment.Font         = New-Object System.Drawing.Font('Calibri',9)
+$cb_BufferAlignment.ForeColor    = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_BufferAlignment.BackColor    = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label84                         = New-Object system.Windows.Forms.Label
+$Label84.text                    = "BufferAlignment:"
+$Label84.AutoSize                = $true
+$Label84.width                   = 25
+$Label84.height                  = 10
+$Label84.location                = New-Object System.Drawing.Point(6,86)
+$Label84.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label84.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_BufferMultiplier             = New-Object system.Windows.Forms.ComboBox
+$cb_BufferMultiplier.width       = 190
+$cb_BufferMultiplier.height      = 20
+@('512') | ForEach-Object {[void] $cb_BufferMultiplier.Items.Add($_)}
+$cb_BufferMultiplier.location    = New-Object System.Drawing.Point(177,61)
+$cb_BufferMultiplier.Font        = New-Object System.Drawing.Font('Calibri',9)
+$cb_BufferMultiplier.ForeColor   = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_BufferMultiplier.BackColor   = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label85                         = New-Object system.Windows.Forms.Label
+$Label85.text                    = "(Rec/Send) BufferMultiplier:"
+$Label85.AutoSize                = $true
+$Label85.width                   = 25
+$Label85.height                  = 10
+$Label85.location                = New-Object System.Drawing.Point(6,64)
+$Label85.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label85.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$Label86                         = New-Object system.Windows.Forms.Label
+$Label86.text                    = "SmallBufferListDepth:"
+$Label86.AutoSize                = $true
+$Label86.width                   = 25
+$Label86.height                  = 10
+$Label86.location                = New-Object System.Drawing.Point(6,218)
+$Label86.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label86.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_SmallBufferListDepth         = New-Object system.Windows.Forms.ComboBox
+$cb_SmallBufferListDepth.width   = 190
+$cb_SmallBufferListDepth.height  = 20
+@('8','16') | ForEach-Object {[void] $cb_SmallBufferListDepth.Items.Add($_)}
+$cb_SmallBufferListDepth.location  = New-Object System.Drawing.Point(177,215)
+$cb_SmallBufferListDepth.Font    = New-Object System.Drawing.Font('Calibri',9)
+$cb_SmallBufferListDepth.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_SmallBufferListDepth.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label87                         = New-Object system.Windows.Forms.Label
+$Label87.text                    = "MediumBufferListDepth:"
+$Label87.AutoSize                = $true
+$Label87.width                   = 25
+$Label87.height                  = 10
+$Label87.location                = New-Object System.Drawing.Point(6,240)
+$Label87.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label87.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_MediumBufferListDepth        = New-Object system.Windows.Forms.ComboBox
+$cb_MediumBufferListDepth.width  = 190
+$cb_MediumBufferListDepth.height  = 20
+@('4','8','16') | ForEach-Object {[void] $cb_MediumBufferListDepth.Items.Add($_)}
+$cb_MediumBufferListDepth.location  = New-Object System.Drawing.Point(177,237)
+$cb_MediumBufferListDepth.Font   = New-Object System.Drawing.Font('Calibri',9)
+$cb_MediumBufferListDepth.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_MediumBufferListDepth.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label88                         = New-Object system.Windows.Forms.Label
+$Label88.text                    = "LargBufferListDepth:"
+$Label88.AutoSize                = $true
+$Label88.width                   = 25
+$Label88.height                  = 10
+$Label88.location                = New-Object System.Drawing.Point(6,262)
+$Label88.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label88.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_LargBufferListDepth          = New-Object system.Windows.Forms.ComboBox
+$cb_LargBufferListDepth.width    = 190
+$cb_LargBufferListDepth.height   = 20
+@('0','2','10') | ForEach-Object {[void] $cb_LargBufferListDepth.Items.Add($_)}
+$cb_LargBufferListDepth.location  = New-Object System.Drawing.Point(177,259)
+$cb_LargBufferListDepth.Font     = New-Object System.Drawing.Font('Calibri',9)
+$cb_LargBufferListDepth.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_LargBufferListDepth.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label89                         = New-Object system.Windows.Forms.Label
+$Label89.text                    = "DisableChainedReceive:"
+$Label89.AutoSize                = $true
+$Label89.width                   = 25
+$Label89.height                  = 10
+$Label89.location                = New-Object System.Drawing.Point(5,306)
+$Label89.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label89.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_DisableChainedReceive        = New-Object system.Windows.Forms.ComboBox
+$cb_DisableChainedReceive.width  = 190
+$cb_DisableChainedReceive.height  = 20
+@('0','1') | ForEach-Object {[void] $cb_DisableChainedReceive.Items.Add($_)}
+$cb_DisableChainedReceive.location  = New-Object System.Drawing.Point(177,303)
+$cb_DisableChainedReceive.Font   = New-Object System.Drawing.Font('Calibri',9)
+$cb_DisableChainedReceive.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_DisableChainedReceive.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label90                         = New-Object system.Windows.Forms.Label
+$Label90.text                    = "DisableDirectAcceptEx:"
+$Label90.AutoSize                = $true
+$Label90.width                   = 25
+$Label90.height                  = 10
+$Label90.location                = New-Object System.Drawing.Point(5,328)
+$Label90.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label90.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_DisableDirectAcceptEx        = New-Object system.Windows.Forms.ComboBox
+$cb_DisableDirectAcceptEx.width  = 190
+$cb_DisableDirectAcceptEx.height  = 20
+@('0','1') | ForEach-Object {[void] $cb_DisableDirectAcceptEx.Items.Add($_)}
+$cb_DisableDirectAcceptEx.location  = New-Object System.Drawing.Point(177,325)
+$cb_DisableDirectAcceptEx.Font   = New-Object System.Drawing.Font('Calibri',9)
+$cb_DisableDirectAcceptEx.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_DisableDirectAcceptEx.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label91                         = New-Object system.Windows.Forms.Label
+$Label91.text                    = "DisableRawSecurity:"
+$Label91.AutoSize                = $true
+$Label91.width                   = 25
+$Label91.height                  = 10
+$Label91.location                = New-Object System.Drawing.Point(5,350)
+$Label91.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label91.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_DisableRawSecurity           = New-Object system.Windows.Forms.ComboBox
+$cb_DisableRawSecurity.width     = 190
+$cb_DisableRawSecurity.height    = 20
+@('0','1') | ForEach-Object {[void] $cb_DisableRawSecurity.Items.Add($_)}
+$cb_DisableRawSecurity.location  = New-Object System.Drawing.Point(177,347)
+$cb_DisableRawSecurity.Font      = New-Object System.Drawing.Font('Calibri',9)
+$cb_DisableRawSecurity.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_DisableRawSecurity.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label92                         = New-Object system.Windows.Forms.Label
+$Label92.text                    = "DynamicSendBufferDisable:"
+$Label92.AutoSize                = $true
+$Label92.width                   = 25
+$Label92.height                  = 10
+$Label92.location                = New-Object System.Drawing.Point(5,372)
+$Label92.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label92.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_DynamicSendBufferDisable     = New-Object system.Windows.Forms.ComboBox
+$cb_DynamicSendBufferDisable.width  = 190
+$cb_DynamicSendBufferDisable.height  = 20
+@('0','1') | ForEach-Object {[void] $cb_DynamicSendBufferDisable.Items.Add($_)}
+$cb_DynamicSendBufferDisable.location  = New-Object System.Drawing.Point(177,369)
+$cb_DynamicSendBufferDisable.Font  = New-Object System.Drawing.Font('Calibri',9)
+$cb_DynamicSendBufferDisable.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_DynamicSendBufferDisable.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label93                         = New-Object system.Windows.Forms.Label
+$Label93.text                    = "FastSendDatagramThreshold:"
+$Label93.AutoSize                = $true
+$Label93.width                   = 25
+$Label93.height                  = 10
+$Label93.location                = New-Object System.Drawing.Point(5,394)
+$Label93.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label93.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_FastSendDatagramThreshold    = New-Object system.Windows.Forms.ComboBox
+$cb_FastSendDatagramThreshold.width  = 190
+$cb_FastSendDatagramThreshold.height  = 20
+@('1024') | ForEach-Object {[void] $cb_FastSendDatagramThreshold.Items.Add($_)}
+$cb_FastSendDatagramThreshold.location  = New-Object System.Drawing.Point(177,391)
+$cb_FastSendDatagramThreshold.Font  = New-Object System.Drawing.Font('Calibri',9)
+$cb_FastSendDatagramThreshold.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_FastSendDatagramThreshold.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label94                         = New-Object system.Windows.Forms.Label
+$Label94.text                    = "FastCopyReceiveThreshold:"
+$Label94.AutoSize                = $true
+$Label94.width                   = 25
+$Label94.height                  = 10
+$Label94.location                = New-Object System.Drawing.Point(5,416)
+$Label94.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label94.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_FastCopyReceiveThreshold     = New-Object system.Windows.Forms.ComboBox
+$cb_FastCopyReceiveThreshold.width  = 190
+$cb_FastCopyReceiveThreshold.height  = 20
+@('1024') | ForEach-Object {[void] $cb_FastCopyReceiveThreshold.Items.Add($_)}
+$cb_FastCopyReceiveThreshold.location  = New-Object System.Drawing.Point(177,413)
+$cb_FastCopyReceiveThreshold.Font  = New-Object System.Drawing.Font('Calibri',9)
+$cb_FastCopyReceiveThreshold.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_FastCopyReceiveThreshold.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label95                         = New-Object system.Windows.Forms.Label
+$Label95.text                    = "IgnorePushBitOnReceives:"
+$Label95.AutoSize                = $true
+$Label95.width                   = 25
+$Label95.height                  = 10
+$Label95.location                = New-Object System.Drawing.Point(5,438)
+$Label95.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label95.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_IgnorePushBitOnReceives      = New-Object system.Windows.Forms.ComboBox
+$cb_IgnorePushBitOnReceives.width  = 190
+$cb_IgnorePushBitOnReceives.height  = 20
+@('0','1') | ForEach-Object {[void] $cb_IgnorePushBitOnReceives.Items.Add($_)}
+$cb_IgnorePushBitOnReceives.location  = New-Object System.Drawing.Point(177,435)
+$cb_IgnorePushBitOnReceives.Font  = New-Object System.Drawing.Font('Calibri',9)
+$cb_IgnorePushBitOnReceives.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_IgnorePushBitOnReceives.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label96                         = New-Object system.Windows.Forms.Label
+$Label96.text                    = "IgnoreOrderlyRelease:"
+$Label96.AutoSize                = $true
+$Label96.width                   = 25
+$Label96.height                  = 10
+$Label96.location                = New-Object System.Drawing.Point(5,460)
+$Label96.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label96.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_IgnoreOrderlyRelease         = New-Object system.Windows.Forms.ComboBox
+$cb_IgnoreOrderlyRelease.width   = 190
+$cb_IgnoreOrderlyRelease.height  = 20
+@('0','1') | ForEach-Object {[void] $cb_IgnoreOrderlyRelease.Items.Add($_)}
+$cb_IgnoreOrderlyRelease.location  = New-Object System.Drawing.Point(177,457)
+$cb_IgnoreOrderlyRelease.Font    = New-Object System.Drawing.Font('Calibri',9)
+$cb_IgnoreOrderlyRelease.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_IgnoreOrderlyRelease.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label97                         = New-Object system.Windows.Forms.Label
+$Label97.text                    = "TransmitWorker:"
+$Label97.AutoSize                = $true
+$Label97.width                   = 25
+$Label97.height                  = 10
+$Label97.location                = New-Object System.Drawing.Point(5,482)
+$Label97.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label97.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_TransmitWorker               = New-Object system.Windows.Forms.ComboBox
+$cb_TransmitWorker.width         = 190
+$cb_TransmitWorker.height        = 20
+@('16','32') | ForEach-Object {[void] $cb_TransmitWorker.Items.Add($_)}
+$cb_TransmitWorker.location      = New-Object System.Drawing.Point(177,479)
+$cb_TransmitWorker.Font          = New-Object System.Drawing.Font('Calibri',9)
+$cb_TransmitWorker.ForeColor     = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_TransmitWorker.BackColor     = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Label98                         = New-Object system.Windows.Forms.Label
+$Label98.text                    = "PriorityBoost:"
+$Label98.AutoSize                = $true
+$Label98.width                   = 25
+$Label98.height                  = 10
+$Label98.location                = New-Object System.Drawing.Point(5,504)
+$Label98.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label98.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_PriorityBoost                = New-Object system.Windows.Forms.ComboBox
+$cb_PriorityBoost.width          = 190
+$cb_PriorityBoost.height         = 20
+@('2','1','0') | ForEach-Object {[void] $cb_PriorityBoost.Items.Add($_)}
+$cb_PriorityBoost.location       = New-Object System.Drawing.Point(177,501)
+$cb_PriorityBoost.Font           = New-Object System.Drawing.Font('Calibri',9)
+$cb_PriorityBoost.ForeColor      = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_PriorityBoost.BackColor      = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$btn_InterruptApply              = New-Object system.Windows.Forms.Button
+$btn_InterruptApply.text         = "Apply"
+$btn_InterruptApply.width        = 60
+$btn_InterruptApply.height       = 21
+$btn_InterruptApply.location     = New-Object System.Drawing.Point(11,560)
+$btn_InterruptApply.Font         = New-Object System.Drawing.Font('Calibri',10)
+$btn_InterruptApply.ForeColor    = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$Label68                         = New-Object system.Windows.Forms.Label
+$Label68.text                    = "CoalesceBufferSize:"
+$Label68.AutoSize                = $true
+$Label68.width                   = 25
+$Label68.height                  = 10
+$Label68.location                = New-Object System.Drawing.Point(9,435)
+$Label68.Font                    = New-Object System.Drawing.Font('Calibri',10)
+$Label68.ForeColor               = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+
+$cb_CoalesceBufferSize           = New-Object system.Windows.Forms.ComboBox
+$cb_CoalesceBufferSize.width     = 190
+$cb_CoalesceBufferSize.height    = 20
+@('2048') | ForEach-Object {[void] $cb_CoalesceBufferSize.Items.Add($_)}
+$cb_CoalesceBufferSize.location  = New-Object System.Drawing.Point(193,432)
+$cb_CoalesceBufferSize.Font      = New-Object System.Drawing.Font('Calibri',9)
+$cb_CoalesceBufferSize.ForeColor  = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$cb_CoalesceBufferSize.BackColor  = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+
+$Groupbox9.controls.AddRange(@(
+    $lbl_Autotune,
+    $lbl_TcpWindowAutoTuning,$cb_TcpWindowAutoTuning,
+    $lbl_WindowsScalingHeuristics,$cb_WindowsScalingHeuristics,
+    $lbl_CongestionControlProvider,$cb_CongestionControlProvider,
+    $lbl_ReceiveSideScaling,$cb_ReceiveSideScaling,
+    $lbl_Rsc,$cb_Rsc,
+    $lbl_Ttl,$tb_Ttl,
+    $lbl_EcnCapability,$cb_EcnCapability,
+    $lbl_ChecksumOffloading,$cb_ChecksumOffloading,
+    $lbl_TcpChimney,$cb_TcpChimney,
+    $lbl_Lso,$cb_Lso,
+    $lbl_Tcp1323Timestamps,$cb_Tcp1323Timestamps,
+    $lbl_IEOptimization,
+    $lbl_MaxConnectionsPer10,$tb_MaxConnectionsPer10,
+    $lbl_MaxConnectionsPerServer,$tb_MaxConnectionsPerServer,
+    $lbl_HostResolutionPriority,
+    $lbl_LocalPriority,$tb_LocalPriority,
+    $lbl_HostPriority,$tb_HostPriority,
+    $lbl_DnsPriority,$tb_DnsPriority,
+    $lbl_NetbtPriority,$tb_NetbtPriority,
+    $lbl_MaxSynRetransmissions,$tb_MaxSynRetransmissions,
+    $lbl_NonSackRttResiliency,$cb_NonSackRttResiliency,
+    $lbl_RtoHeader,$lbl_InitialRto,$tb_InitialRto,$lbl_MinRto,$tb_MinRto,
+    $lbl_TypeQualityService,
+    $lbl_QosNonBestEffort,$tb_QosNonBestEffort,
+    $lbl_QosNla,$cb_QosNla,
+    $lbl_NetworkThrottleHeader,$lbl_NetworkThrottlingIndex,$tb_NetworkThrottlingIndex,
+    $lbl_DisableNagleHeader,$lbl_TcpAckFrequency,$tb_TcpAckFrequency,$lbl_TcpNoDelay,$tb_TcpNoDelay,$lbl_TcpDelAckTicks,$tb_TcpDelAckTicks,
+    <# $lbl_NetworkMemoryAllocation, #>$lbl_LargeSystemCache,$cb_LargeSystemCache,
+    $lbl_DynamicPortAllocation,$lbl_MaxUserPort,$tb_MaxUserPort,$lbl_TcpTimedWaitDelay,$tb_TcpTimedWaitDelay,
+    $btn_TcpSafe,$btn_TcpBalanced,$btn_TcpAggressive,$btn_ToggleAutotune,$btn_IrqAffinityDialog,$btn_NicExtrasDialog
+))
+$Groupbox10.controls.AddRange(@($lbl_QoS_Presets,$cb_QoS_Preset,$btn_QoS_BF6,$btn_QoS_Multi,$btn_QoS_Custom,$btn_QoS_Remove,$btn_Security,$lbl_QoS_List,$lst_QoS))
+$Groupbox11.controls.AddRange(@($lbl_Mmcss,$btn_AckTweaks,$btn_MmcssApply,$btn_MmcssRevert))
+
+$Form.controls.AddRange(@($cb_AdapterNamesCombo,$Label1,$Label2,$lbl_Path,$Label3,$lbl_ndisver,$Groupbox1,$btn_apply,$btn_unqueues,$btn_openreg,$Groupbox2,$btn_applyglobal,$Groupbox3,$btn_applyadv,$btn_adaptrest,$Groupbox5,$Groupbox4,$btn_applypowersettings,$Groupbox7,$btn_applyall,$Groupbox6,$btn_applyInterfaceSettings,$cb_IPv6,$cb_IPv4,$btn_rssaddsupport,$Groupbox8,$btn_registrytweaksapply,$btn_tcpOffloadApply,$btn_Opacity,$btn_InterruptApply,$Groupbox9,$Groupbox10,$Groupbox11))
+$Groupbox1.controls.AddRange(@($Label4,$Label5,$Label6,$lbl_rssstatus,$cb_rss_onoff,$cb_rssqueues,$cb_rssprofile,$Label7,$cb_rssbaseproc,$Label8,$cb_rssmaxproc,$Label9,$cb_rssmaxprocs,$Label35,$cb_DisablePortScaling,$Label42,$cb_ManyCoreScaling))
+$Groupbox2.controls.AddRange(@($Label10,$cb_osrss,$Label11,$cb_osrsc,$Label12,$cb_oschimney,$Label13,$cb_ostaskoff,$cb_osntd,$Label14,$cb_osntdais,$Label15,$cb_ospcf,$Label16))
+$Groupbox3.controls.AddRange(@($Label17,$cb_flowcontrol,$Label18,$Label19,$Label20,$Label21,$Label22,$Label23,$cb_InterruptModeration,$cb_IPChecksumOffloadIPv4,$cb_TCPChecksumOffloadIPv4,$cb_TCPChecksumOffloadIPv6,$cb_UDPChecksumOffloadIPv4,$cb_UDPChecksumOffloadIPv6,$Label24,$cb_InterruptModerationRate,$Label25,$Label26,$cb_LsoV2IPv4,$cb_LsoV2IPv6,$Label27,$cb_LsoV1IPv4,$Label28,$cb_PMNSOffload,$Label29,$cb_PMARPOffload,$cb_PriorityVLANTag,$Label00,$Label30,$cb_ReceiveBuffers,$Label31,$cb_TransmitBuffers,$Label73,$tb_TxIntDelay,$Label74,$cb_PacketDirect,$Label75,$cb_EnableCoalesce,$Label76,$cb_EnableUdpTxScaling,$Label68,$cb_CoalesceBufferSize))
+$Groupbox5.controls.AddRange(@($Label32,$Label33,$cb_tcpiprssbasecpu,$cb_ndisrssbasecpu))
+$Groupbox4.controls.AddRange(@(
+    $Label34,$cb_EnablePME,
+    $Label36,$cb_EnableDynamicPowerGating,
+    $Label37,$cb_EnableConnectedPowerGating,
+    $Label38,$cb_AutoPowerSaveModeEnabled,
+    $cb_NicAutoPowerSaver,
+    $Label39,$Label40,$cb_DisableDelayedPowerUp,
+    $Label41,$cb_ReduceSpeedOnPowerDown,
+    $Label_pss,$cb_DefaultSelectiveSuspend,
+    $Label_aspm,$cb_PcieAspm,
+    $Label_devSleep,$cb_DevicePowerSaving,
+    $Label_allowWake,$cb_AllowWake
+))
+$Groupbox7.controls.AddRange(@($Label44,$cb_AdvertiseDefaultRoute,$Label45,$cb_Advertising,$Label46,$cb_AutomaticMetric,$cb_ClampMss,$Label47,$cb_DirectedMacWolPattern,$Label48,$Label49,$cb_EcnMarking,$Label50,$cb_ForceArpNdWolPattern,$Label51,$cb_Forwarding,$cb_IgnoreDefaultRoutes,$Label52,$Label53,$cb_ManagedAddressConfiguration,$Label54,$cb_NeighborDiscoverySupported,$Label55,$cb_NeighborUnreachabilityDetection,$Label56,$cb_OtherStatefulConfiguration,$Label57,$cb_RouterDiscovery,$Label58,$cb_Store,$Label59,$cb_WeakHostReceive,$Label60,$cb_WeakHostSend,$Label61,$tb_CurrentHopLimit,$Label62,$tb_BaseReachableTime,$tb_ReachableTime,$Label63,$Label64,$tb_DadRetransmitTime,$Label65,$tb_DadTransmits,$Label66,$tb_NlMtu,$Label67,$tb_RetransmitTime,$Label69,$Label70,$Label71,$Label72))
+$Groupbox6.controls.AddRange(@($lb_MsiMode,$cb_MsiMode,$lb_InterruptPriority,$cb_InterruptPriority,$lb_DevicePolicy,$cb_DevicePolicy))
+$Groupbox8.controls.AddRange(@($Label43,$Label77,$cb_Afd_defaultrecWin,$cb_Afd_defaultSendWin,$Label78,$cb_DisableAddressSharing,$Label79,$cb_DoNotHoldNICBuffers,$Label80,$cb_SmallBufferSize,$Label81,$cb_MediumBufferSize,$Label82,$cb_LargeBufferSize,$Label83,$cb_HugeBufferSize,$cb_BufferAlignment,$Label84,$cb_BufferMultiplier,$Label85,$Label86,$cb_SmallBufferListDepth,$Label87,$cb_MediumBufferListDepth,$Label88,$cb_LargBufferListDepth,$Label89,$cb_DisableChainedReceive,$Label90,$cb_DisableDirectAcceptEx,$Label91,$cb_DisableRawSecurity,$Label92,$cb_DynamicSendBufferDisable,$Label93,$cb_FastSendDatagramThreshold,$Label94,$cb_FastCopyReceiveThreshold,$Label95,$cb_IgnorePushBitOnReceives,$Label96,$cb_IgnoreOrderlyRelease,$Label97,$cb_TransmitWorker,$Label98,$cb_PriorityBoost))
+$groupbox_Tests.controls.AddRange(@($btn_TestPing,$btn_TestTraceroute,$btn_TestMtu,$btn_TestBufferbloat,$btn_TestDNSJumper))
+
+
+#region Logic 
+#Cleaning Code
+cls
+Add-Type -Name Window -Namespace Console -MemberDefinition '
+[DllImport("Kernel32.dll")]
+public static extern IntPtr GetConsoleWindow();
+
+[DllImport("user32.dll")]
+public static extern bool ShowWindow(IntPtr hWnd, Int32 nCmdShow);'
+
+#Write your logic code here
+
+#GUI Settings
+#$ErrorActionPreference="Stop"
+#$Form.Opacity = "0.90"
+
+#Deselect Content for Updating Text/Value Changes
+$Form.Add_MouseClick({$Form.ActiveControl = $null})
+$Groupbox1.Add_MouseClick({$Form.ActiveControl = $null})
+$Groupbox2.Add_MouseClick({$Form.ActiveControl = $null})
+$Groupbox3.Add_MouseClick({$Form.ActiveControl = $null})
+$Groupbox4.Add_MouseClick({$Form.ActiveControl = $null})
+$Groupbox5.Add_MouseClick({$Form.ActiveControl = $null})
+$Groupbox7.Add_MouseClick({$Form.ActiveControl = $null})
+$Groupbox6.Add_MouseClick({$Form.ActiveControl = $null})
+$Groupbox8.Add_MouseClick({$Form.ActiveControl = $null})
+$Groupbox9.Add_MouseClick({$Form.ActiveControl = $null})
+$Groupbox10.Add_MouseClick({$Form.ActiveControl = $null})
+$Groupbox11.Add_MouseClick({$Form.ActiveControl = $null})
+
+
+#Groupboxes
+$Groupbox1.Font                = New-Object System.Drawing.Font('Calibri',10)
+$Groupbox1.ForeColor           = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$Groupbox2.Font                = New-Object System.Drawing.Font('Calibri',10)
+$Groupbox2.ForeColor           = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$Groupbox3.Font                = New-Object System.Drawing.Font('Calibri',10)
+$Groupbox3.ForeColor           = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$Groupbox4.Font                = New-Object System.Drawing.Font('Calibri',10)
+$Groupbox4.ForeColor           = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$Groupbox5.Font                = New-Object System.Drawing.Font('Calibri',10)
+$Groupbox5.ForeColor           = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$Groupbox7.Font                = New-Object System.Drawing.Font('Calibri',10)
+$Groupbox7.ForeColor           = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$Groupbox6.Font                = New-Object System.Drawing.Font('Calibri',10)
+$Groupbox6.ForeColor           = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$Groupbox8.Font                = New-Object System.Drawing.Font('Calibri',10)
+$Groupbox8.ForeColor           = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+$Groupbox9.Font                = New-Object System.Drawing.Font('Calibri',10)
+$Groupbox9.ForeColor           = $ColorPrimary
+$Groupbox10.Font               = New-Object System.Drawing.Font('Calibri',10)
+$Groupbox10.ForeColor          = $ColorPrimary
+$Groupbox11.Font               = New-Object System.Drawing.Font('Calibri',10)
+$Groupbox11.ForeColor          = $ColorPrimary
+
+
+#Buttons
+$btn_openreg.Flatstyle = 'Flat'
+$btn_apply.Flatstyle = 'Flat'
+$btn_applyglobal.Flatstyle = 'Flat'
+$btn_applyadv.Flatstyle = 'Flat'
+$btn_adaptrest.Flatstyle = 'Flat'
+$btn_unqueues.Flatstyle = 'Flat'
+#$btn_applotadapters.Flatstyle = 'Flat'
+$btn_applypowersettings.Flatstyle = 'Flat'
+$btn_applyall.Flatstyle = 'Flat'
+$btn_applyInterfaceSettings.Flatstyle = 'Flat'
+$btn_rssaddsupport.Flatstyle = 'Flat'
+$btn_registrytweaksapply.Flatstyle = 'Flat'
+$btn_tcpOffloadApply.Flatstyle = 'Flat'
+$btn_Opacity.Flatstyle = 'Flat'
+$btn_TcpSafe.Flatstyle = 'Flat'
+$btn_TcpBalanced.Flatstyle = 'Flat'
+$btn_TcpAggressive.Flatstyle = 'Flat'
+$btn_ToggleAutotune.Flatstyle = 'Flat'
+$btn_QoS_BF6.Flatstyle = 'Flat'
+$btn_QoS_Multi.Flatstyle = 'Flat'
+$btn_QoS_Custom.Flatstyle = 'Flat'
+$btn_QoS_Remove.Flatstyle = 'Flat'
+$btn_Security.Flatstyle = 'Flat'
+$btn_InterruptApply.Flatstyle = 'Flat'
+$btn_IrqAffinityDialog.Flatstyle = 'Flat'
+$btn_MmcssApply.Flatstyle = 'Flat'
+$btn_MmcssRevert.Flatstyle = 'Flat'
+$btn_AckTweaks.FlatStyle = 'Flat'
+
+$btn_TcpSafe.Add_Click({
+    Set-TcpPreset -Preset 'SAFE'
+})
+
+$btn_TcpBalanced.Add_Click({
+    Set-TcpPreset -Preset 'BALANCED'
+})
+
+$btn_TcpAggressive.Add_Click({
+    Set-TcpPreset -Preset 'AGGRESSIVE'
+})
+
+$btn_ToggleAutotune.Add_Click({
+    $new = Toggle-TcpAutotuning
+    $lbl_Autotune.Text = "Auto-Tuning: " + $new
+})
+
+Add-Type -AssemblyName Microsoft.VisualBasic | Out-Null
+
+function Show-QoSCustomDialog {
+    $dlg                 = New-Object System.Windows.Forms.Form
+    $dlg.Text            = "QoS Custom"
+    $dlg.Size            = New-Object System.Drawing.Size(320,260)
+    $dlg.StartPosition   = "CenterParent"
+    $dlg.BackColor       = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+    $dlg.Font            = New-Object System.Drawing.Font('Calibri',10)
+    $dlg.ForeColor       = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox     = $false
+    $dlg.MinimizeBox     = $false
+
+    $lblName        = New-Object System.Windows.Forms.Label
+    $lblName.Text   = "Policy name"
+    $lblName.AutoSize = $true
+    $lblName.Location = New-Object System.Drawing.Point(15,20)
+    $dlg.Controls.Add($lblName)
+
+    $tbName         = New-Object System.Windows.Forms.TextBox
+    $tbName.Size    = New-Object System.Drawing.Size(250,24)
+    $tbName.Location= New-Object System.Drawing.Point(15,40)
+    $tbName.Text    = "QoS-MyGame"
+    $dlg.Controls.Add($tbName)
+
+    $lblExe         = New-Object System.Windows.Forms.Label
+    $lblExe.Text    = "Executable name"
+    $lblExe.AutoSize= $true
+    $lblExe.Location= New-Object System.Drawing.Point(15,70)
+    $dlg.Controls.Add($lblExe)
+
+    $tbExe          = New-Object System.Windows.Forms.TextBox
+    $tbExe.Size     = New-Object System.Drawing.Size(250,24)
+    $tbExe.Location = New-Object System.Drawing.Point(15,90)
+    $tbExe.Text     = "game.exe"
+    $dlg.Controls.Add($tbExe)
+
+    $lblProtocol    = New-Object System.Windows.Forms.Label
+    $lblProtocol.Text= "IP Protocol"
+    $lblProtocol.AutoSize = $true
+    $lblProtocol.Location = New-Object System.Drawing.Point(15,120)
+    $dlg.Controls.Add($lblProtocol)
+
+    $cmbProto       = New-Object System.Windows.Forms.ComboBox
+    $cmbProto.DropDownStyle = 'DropDownList'
+    @('UDP','TCP') | ForEach-Object { [void]$cmbProto.Items.Add($_) }
+    $cmbProto.SelectedIndex = 0
+    $cmbProto.Size     = New-Object System.Drawing.Size(80,24)
+    $cmbProto.Location = New-Object System.Drawing.Point(15,140)
+    $dlg.Controls.Add($cmbProto)
+
+    $lblPriority    = New-Object System.Windows.Forms.Label
+    $lblPriority.Text= "Priority"
+    $lblPriority.AutoSize = $true
+    $lblPriority.Location = New-Object System.Drawing.Point(110,120)
+    $dlg.Controls.Add($lblPriority)
+
+    $cmbPrio        = New-Object System.Windows.Forms.ComboBox
+    $cmbPrio.DropDownStyle = 'DropDownList'
+    @(0,1,2,3,4,5,6,7) | ForEach-Object { [void]$cmbPrio.Items.Add($_) }
+    $cmbPrio.SelectedItem = 5
+    $cmbPrio.Size     = New-Object System.Drawing.Size(80,24)
+    $cmbPrio.Location = New-Object System.Drawing.Point(110,140)
+    $dlg.Controls.Add($cmbPrio)
+
+    $lblDscp        = New-Object System.Windows.Forms.Label
+    $lblDscp.Text   = "DSCP value"
+    $lblDscp.AutoSize = $true
+    $lblDscp.Location = New-Object System.Drawing.Point(205,120)
+    $dlg.Controls.Add($lblDscp)
+
+    $numDscp            = New-Object System.Windows.Forms.NumericUpDown
+    $numDscp.Minimum    = 0
+    $numDscp.Maximum    = 63
+    $numDscp.Value      = 46
+    $numDscp.Location   = New-Object System.Drawing.Point(205,140)
+    $numDscp.Size       = New-Object System.Drawing.Size(60,24)
+    $dlg.Controls.Add($numDscp)
+
+    $btnOk              = New-Object System.Windows.Forms.Button
+    $btnOk.Text         = "Apply"
+    $btnOk.Size         = New-Object System.Drawing.Size(100,28)
+    $btnOk.Location     = New-Object System.Drawing.Point(80,180)
+    $btnOk.ForeColor    = $ColorActionText
+    $btnOk.BackColor    = $ColorQuickAction
+    $btnOk.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $dlg.AcceptButton   = $btnOk
+    $dlg.Controls.Add($btnOk)
+
+    $btnCancel              = New-Object System.Windows.Forms.Button
+    $btnCancel.Text         = "Cancel"
+    $btnCancel.Size         = New-Object System.Drawing.Size(100,28)
+    $btnCancel.Location     = New-Object System.Drawing.Point(190,180)
+    $btnCancel.ForeColor    = $ColorPrimary
+    $btnCancel.BackColor    = $ColorSurface
+    $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+    $dlg.CancelButton       = $btnCancel
+    $dlg.Controls.Add($btnCancel)
+
+    if ($dlg.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return $null }
+
+    $result = [pscustomobject]@{
+        Name     = $tbName.Text.Trim()
+        Exe      = $tbExe.Text.Trim()
+        Protocol = [string]$cmbProto.SelectedItem
+        Priority = [int]$cmbPrio.SelectedItem
+        DSCP     = [int]$numDscp.Value
+    }
+    if ([string]::IsNullOrWhiteSpace($result.Name) -or [string]::IsNullOrWhiteSpace($result.Exe)) { return $null }
+    return $result
+}
+
+$btn_QoS_BF6.Add_Click({
+    $sel = $cb_QoS_Preset.SelectedItem
+    if ([string]::IsNullOrWhiteSpace($sel)) { return }
+    Apply-QoS-Preset -PresetName $sel
+    Refresh-QoSListBox -ListBox $lst_QoS
+})
+
+$btn_QoS_Multi.Add_Click({
+    Apply-QoS-MultiApp
+    Refresh-QoSListBox -ListBox $lst_QoS
+})
+
+$btn_QoS_Custom.Add_Click({
+    $c = Show-QoSCustomDialog
+    if (-not $c) { return }
+    Apply-QoS-Custom -PolicyName $c.Name -ExeName $c.Exe -Protocol $c.Protocol -Priority $c.Priority -DSCP $c.DSCP
+    Refresh-QoSListBox -ListBox $lst_QoS
+})
+
+$btn_QoS_Remove.Add_Click({
+    if ([System.Windows.Forms.MessageBox]::Show("Rimuovere TUTTE le policy QoS (QoS-*, PrimeBuild-*, BF6-UDP-*) dall'ActiveStore?","Conferma",
+        [System.Windows.Forms.MessageBoxButtons]::YesNo,
+        [System.Windows.Forms.MessageBoxIcon]::Warning) -eq 'Yes') {
+        Remove-QoS-All
+        Refresh-QoSListBox -ListBox $lst_QoS
+    }
+})
+
+$btn_Security.Add_Click({ Show-SecurityDialog })
+
+Refresh-QoSListBox -ListBox $lst_QoS
+
+$btn_MmcssApply.Add_Click({
+    if (Apply-NdisMmcssOptimizations) {
+        $lbl_Mmcss.Text = Get-MmcssStatusText
+    }
+})
+
+$btn_AckTweaks.Add_Click({ Show-AckTweaksDialog })
+
+function Show-SecurityDialog {
+    $dlg                 = New-Object System.Windows.Forms.Form
+    $dlg.Text            = "Security"
+    $dlg.Size            = New-Object System.Drawing.Size(580,310)
+    $dlg.StartPosition   = "CenterParent"
+    $dlg.BackColor       = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+    $dlg.Font            = New-Object System.Drawing.Font('Calibri',10)
+    $dlg.ForeColor       = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox     = $false
+    $dlg.MinimizeBox     = $false
+
+    $lblStatus = New-Object System.Windows.Forms.Label
+    $lblStatus.AutoSize = $false
+    $lblStatus.Size     = New-Object System.Drawing.Size(540,60)
+    $lblStatus.Location = New-Object System.Drawing.Point(15,15)
+    $lblStatus.Text     = Get-SecurityStatusText
+    $dlg.Controls.Add($lblStatus)
+
+    $btnSafe = New-Object System.Windows.Forms.Button
+    $btnSafe.Text  = "Apply SAFE"
+    $btnSafe.Size  = New-Object System.Drawing.Size(170,36)
+    $btnSafe.Location = New-Object System.Drawing.Point(15,90)
+    $btnSafe.ForeColor= [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+    $btnSafe.BackColor= [System.Drawing.ColorTranslator]::FromHtml("#171717")
+    $btnSafe.Font  = New-Object System.Drawing.Font('Calibri',11,[System.Drawing.FontStyle]::Bold)
+    $dlg.Controls.Add($btnSafe)
+
+    $btnAdv  = New-Object System.Windows.Forms.Button
+    $btnAdv.Text   = "Apply ADVANCED"
+    $btnAdv.Size   = New-Object System.Drawing.Size(170,36)
+    $btnAdv.Location= New-Object System.Drawing.Point(195,90)
+    $btnAdv.ForeColor= [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+    $btnAdv.BackColor= [System.Drawing.ColorTranslator]::FromHtml("#171717")
+    $btnAdv.Font   = New-Object System.Drawing.Font('Calibri',11,[System.Drawing.FontStyle]::Bold)
+    $dlg.Controls.Add($btnAdv)
+
+    $btnRevert = New-Object System.Windows.Forms.Button
+    $btnRevert.Text  = "Revert Security"
+    $btnRevert.Size  = New-Object System.Drawing.Size(170,36)
+    $btnRevert.Location = New-Object System.Drawing.Point(375,90)
+    $btnRevert.ForeColor= [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+    $btnRevert.BackColor= [System.Drawing.ColorTranslator]::FromHtml("#171717")
+    $btnRevert.Font  = New-Object System.Drawing.Font('Calibri',11,[System.Drawing.FontStyle]::Bold)
+    $dlg.Controls.Add($btnRevert)
+
+    $txtNote = New-Object System.Windows.Forms.Label
+    $txtNote.AutoSize = $false
+    $txtNote.Size     = New-Object System.Drawing.Size(540,70)
+    $txtNote.Location = New-Object System.Drawing.Point(15,135)
+    $txtNote.Text     = 'Note: "ADVANCED" include SAFE + hardening extra (LLMNR, mDNS, RDP, RemoteRegistry, WSH, SMBv1, servizi WS-Discovery, profilo firewall piu'' restrittivo). Alcune modifiche richiedono riavvio. Il revert non ri-abilita SMB1.'
+    $dlg.Controls.Add($txtNote)
+
+    $btnClose = New-Object System.Windows.Forms.Button
+    $btnClose.Text  = "Close"
+    $btnClose.Size  = New-Object System.Drawing.Size(90,30)
+    $btnClose.Location = New-Object System.Drawing.Point(465,230)
+    $btnClose.ForeColor= [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+    $btnClose.BackColor= [System.Drawing.ColorTranslator]::FromHtml("#171717")
+    $dlg.Controls.Add($btnClose)
+
+    $btnSafe.Add_Click({
+        if (Apply-SecuritySAFE) {
+            [System.Windows.Forms.MessageBox]::Show("Security SAFE applicata.","Security",[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+            $lblStatus.Text = Get-SecurityStatusText
+        } else {
+            [System.Windows.Forms.MessageBox]::Show("Errore durante l'applicazione SAFE.","Security",[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+        }
+    })
+    $btnAdv.Add_Click({
+        if (Apply-SecurityADV) {
+            [System.Windows.Forms.MessageBox]::Show("Security ADVANCED applicata. (Riavvio consigliato)","Security",[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+            $lblStatus.Text = Get-SecurityStatusText
+        } else {
+            [System.Windows.Forms.MessageBox]::Show("Errore durante l'applicazione ADVANCED.","Security",[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+        }
+    })
+    $btnRevert.Add_Click({
+        if (Revert-SecurityPB) {
+            [System.Windows.Forms.MessageBox]::Show("Revert Security applicato (dove possibile).","Security",[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+            $lblStatus.Text = Get-SecurityStatusText
+        } else {
+            [System.Windows.Forms.MessageBox]::Show("Errore nel revert.","Security",[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+        }
+    })
+    $btnClose.Add_Click({ $dlg.Close() | Out-Null })
+
+    $dlg.ShowDialog() | Out-Null
+}
+
+
+function Show-RevertCenterDialog {
+    $dlg                 = New-Object System.Windows.Forms.Form
+    $dlg.Text            = "Revert Center"
+    $dlg.Size            = New-Object System.Drawing.Size(560,360)
+    $dlg.StartPosition   = "CenterParent"
+    $dlg.BackColor       = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+    $dlg.Font            = New-Object System.Drawing.Font('Calibri',10)
+    $dlg.ForeColor       = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox     = $false
+    $dlg.MinimizeBox     = $false
+
+    $grp = New-Object System.Windows.Forms.GroupBox
+    $grp.Text = "Select what to revert"
+    $grp.Location = New-Object System.Drawing.Point(15,15)
+    $grp.Size     = New-Object System.Drawing.Size(520,140)
+    $grp.ForeColor= [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+    $dlg.Controls.Add($grp)
+
+    $chkTcp   = New-Object System.Windows.Forms.CheckBox
+    $chkTcp.Text = "TCP / OS Offloads (autotuning, congestion provider, ECN, HyStart, timestamps, pacing, RTO)"
+    $chkTcp.AutoSize = $true
+    $chkTcp.Location = New-Object System.Drawing.Point(15,25)
+    $grp.Controls.Add($chkTcp)
+
+    $chkQos   = New-Object System.Windows.Forms.CheckBox
+    $chkQos.Text = "QoS policies (ActiveStore) - rimuovi BF6, QoS-*, PrimeBuild-*"
+    $chkQos.AutoSize = $true
+    $chkQos.Location = New-Object System.Drawing.Point(15,50)
+    $grp.Controls.Add($chkQos)
+
+    $chkMmcss = New-Object System.Windows.Forms.CheckBox
+    $chkMmcss.Text = "NDIS & MMCSS (NetworkThrottlingIndex / SystemResponsiveness)"
+    $chkMmcss.AutoSize = $true
+    $chkMmcss.Location = New-Object System.Drawing.Point(15,75)
+    $grp.Controls.Add($chkMmcss)
+
+    $chkIrq   = New-Object System.Windows.Forms.CheckBox
+    $chkIrq.Text = "IRQ & RSS (reset RSS + ripristina MSI se salvato)"
+    $chkIrq.AutoSize = $true
+    $chkIrq.Location = New-Object System.Drawing.Point(15,100)
+    $grp.Controls.Add($chkIrq)
+
+    $chkAck   = New-Object System.Windows.Forms.CheckBox
+    $chkAck.Text = "ACK tweaks per-NIC (TcpAckFrequency/TCPNoDelay/TcpDelAckTicks) - tutte le NIC"
+    $chkAck.AutoSize = $true
+    $chkAck.Location = New-Object System.Drawing.Point(15,125)
+    $grp.Controls.Add($chkAck)
+
+    $btnDo    = New-Object System.Windows.Forms.Button
+    $btnDo.Text = "Revert Selected"
+    $btnDo.Size = New-Object System.Drawing.Size(150,30)
+    $btnDo.Location = New-Object System.Drawing.Point(15,170)
+    $btnDo.ForeColor= [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+    $btnDo.BackColor= [System.Drawing.ColorTranslator]::FromHtml("#171717")
+    $dlg.Controls.Add($btnDo)
+
+    $btnReport = New-Object System.Windows.Forms.Button
+    $btnReport.Text = "Generate Report"
+    $btnReport.Size = New-Object System.Drawing.Size(150,30)
+    $btnReport.Location = New-Object System.Drawing.Point(180,170)
+    $btnReport.ForeColor= [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+    $btnReport.BackColor= [System.Drawing.ColorTranslator]::FromHtml("#171717")
+    $dlg.Controls.Add($btnReport)
+
+    $txt = New-Object System.Windows.Forms.TextBox
+    $txt.Multiline = $true
+    $txt.ScrollBars = 'Vertical'
+    $txt.ReadOnly = $true
+    $txt.Size = New-Object System.Drawing.Size(520,120)
+    $txt.Location = New-Object System.Drawing.Point(15,210)
+    $txt.BackColor = [System.Drawing.ColorTranslator]::FromHtml("#111111")
+    $txt.ForeColor = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+    $dlg.Controls.Add($txt)
+
+    $btnClose = New-Object System.Windows.Forms.Button
+    $btnClose.Text  = "Close"
+    $btnClose.Size  = New-Object System.Drawing.Size(90,30)
+    $btnClose.Location = New-Object System.Drawing.Point(445,170)
+    $btnClose.ForeColor= [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+    $btnClose.BackColor= [System.Drawing.ColorTranslator]::FromHtml("#171717")
+    $dlg.Controls.Add($btnClose)
+
+    $btnDo.Add_Click({
+        $msgs = @()
+        if ($chkTcp.Checked)   { $ok = Revert-TcpGlobals;            $msgs += "TCP revert: "   + ($(if($ok){'OK'}else{'Fail'})) }
+        if ($chkQos.Checked)   { Remove-QoS-All;                      $msgs += "QoS revert: OK" }
+        if ($chkMmcss.Checked) { $ok = Revert-NdisMmcssOptimizations; $msgs += "NDIS/MMCSS revert: " + ($(if($ok){'OK'}else{'Fail'})) }
+        if ($chkIrq.Checked)   { $ok = Revert-IRQAll;                 $msgs += "IRQ/RSS revert: " + ($(if($ok){'OK'}else{'Fail'})) }
+        if ($chkAck.Checked)   { $ok = Revert-AckAll;                 $msgs += "ACK revert: "   + ($(if($ok){'OK'}else{'Fail'})) }
+        if ($msgs.Count -eq 0) { $msgs = @('Nessuna voce selezionata.') }
+        $txt.Text = ($msgs -join ' | ') + "`r`n" + (Build-StatusReport)
+    })
+
+    $btnReport.Add_Click({
+        $txt.Text = Build-StatusReport
+    })
+
+    $btnClose.Add_Click({ $dlg.Close() | Out-Null })
+
+    $txt.Text = Build-StatusReport
+    $dlg.ShowDialog() | Out-Null
+}
+
+$btn_RevertCenter.Add_Click({ Show-RevertCenterDialog })
+
+function Show-AckTweaksDialog {
+    $adapters = Get-NetAdapter | Where-Object { $_.HardwareInterface -eq $true } | Sort-Object Name
+    if (-not $adapters -or $adapters.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show("Nessuna NIC rilevata.","ACK Tweaks",
+            [System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+        return
+    }
+
+    $dlg                 = New-Object System.Windows.Forms.Form
+    $dlg.Text            = "ACK Tweaks"
+    $dlg.Size            = New-Object System.Drawing.Size(520,260)
+    $dlg.StartPosition   = "CenterParent"
+    $dlg.BackColor       = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+    $dlg.Font            = New-Object System.Drawing.Font('Calibri',10)
+    $dlg.ForeColor       = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox     = $false
+    $dlg.MinimizeBox     = $false
+
+    # NIC picker
+    $lblNic = New-Object System.Windows.Forms.Label
+    $lblNic.Text = "Seleziona NIC:"
+    $lblNic.Location = New-Object System.Drawing.Point(15,18)
+    $lblNic.AutoSize = $true
+    $dlg.Controls.Add($lblNic)
+
+    $cmbNic = New-Object System.Windows.Forms.ComboBox
+    $cmbNic.Location = New-Object System.Drawing.Point(120,14)
+    $cmbNic.Size     = New-Object System.Drawing.Size(370,24)
+    $cmbNic.DropDownStyle = 'DropDownList'
+    foreach ($a in $adapters) { [void]$cmbNic.Items.Add("{0} - {1}" -f $a.Name,$a.InterfaceDescription) }
+    $cmbNic.SelectedIndex = 0
+    $dlg.Controls.Add($cmbNic)
+
+    # Apply to all
+    $chkAll = New-Object System.Windows.Forms.CheckBox
+    $chkAll.Text = "Applica/Ripristina su tutte le NIC"
+    $chkAll.Location = New-Object System.Drawing.Point(15,46)
+    $chkAll.AutoSize = $true
+    $dlg.Controls.Add($chkAll)
+
+    # Stato corrente
+    $grpCur = New-Object System.Windows.Forms.GroupBox
+    $grpCur.Text = "Stato corrente (interface-level)"
+    $grpCur.Location = New-Object System.Drawing.Point(15,70)
+    $grpCur.Size     = New-Object System.Drawing.Size(475,90)
+    $grpCur.ForeColor= [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+    $dlg.Controls.Add($grpCur)
+
+    $lblAck = New-Object System.Windows.Forms.Label
+    $lblAck.Location = New-Object System.Drawing.Point(15,30)
+    $lblAck.AutoSize = $true
+    $grpCur.Controls.Add($lblAck)
+
+    # Pulsanti
+    $btnApply = New-Object System.Windows.Forms.Button
+    $btnApply.Text  = "Apply Gaming ACK"
+    $btnApply.Size  = New-Object System.Drawing.Size(160,30)
+    $btnApply.Location = New-Object System.Drawing.Point(15,175)
+    $btnApply.ForeColor= [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+    $btnApply.BackColor= [System.Drawing.ColorTranslator]::FromHtml("#171717")
+    $dlg.Controls.Add($btnApply)
+
+    $btnRevert = New-Object System.Windows.Forms.Button
+    $btnRevert.Text  = "Revert"
+    $btnRevert.Size  = New-Object System.Drawing.Size(120,30)
+    $btnRevert.Location = New-Object System.Drawing.Point(185,175)
+    $btnRevert.ForeColor= [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+    $btnRevert.BackColor= [System.Drawing.ColorTranslator]::FromHtml("#171717")
+    $dlg.Controls.Add($btnRevert)
+
+    $btnClose = New-Object System.Windows.Forms.Button
+    $btnClose.Text  = "Close"
+    $btnClose.Size  = New-Object System.Drawing.Size(100,30)
+    $btnClose.Location = New-Object System.Drawing.Point(390,175)
+    $btnClose.ForeColor= [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+    $btnClose.BackColor= [System.Drawing.ColorTranslator]::FromHtml("#171717")
+    $dlg.Controls.Add($btnClose)
+
+    function RefreshAckStatus {
+        $names = @()
+        if ($chkAll.Checked) { $names = $adapters | ForEach-Object Name }
+        else {
+            $idx = $cmbNic.SelectedIndex; if ($idx -lt 0) { return }
+            $names = @($adapters[$idx].Name)
+        }
+        $lines = @()
+        foreach ($n in $names) {
+            $v = Get-AckValues -NicName $n
+            if ($null -eq $v) { continue }
+            $lines += ("{0}: TcpAckFrequency={1}; TCPNoDelay={2}; TcpDelAckTicks={3}" -f $n,
+                       $(if ($v.TcpAckFrequency -ne $null) { $v.TcpAckFrequency } else { "(n/d)" }),
+                       $(if ($v.TCPNoDelay      -ne $null) { $v.TCPNoDelay }      else { "(n/d)" }),
+                       $(if ($v.TcpDelAckTicks  -ne $null) { $v.TcpDelAckTicks }  else { "(n/d)" }))
+        }
+        if ($lines.Count -eq 0) { $lines = @("(nessun valore impostato)") }
+        $lblAck.Text = ($lines -join "`n")
+    }
+
+    $cmbNic.Add_SelectedIndexChanged({ if (-not $chkAll.Checked) { RefreshAckStatus } })
+    $chkAll.Add_CheckedChanged({ RefreshAckStatus })
+    RefreshAckStatus
+
+    $btnApply.Add_Click({
+        $targets = if ($chkAll.Checked) { $adapters | ForEach-Object Name } else { @($adapters[$cmbNic.SelectedIndex].Name) }
+        if (Apply-AckGaming -NicNames $targets) {
+            [System.Windows.Forms.MessageBox]::Show("ACK Tweaks applicati. (Riavvio consigliato)","ACK",
+                [System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+            RefreshAckStatus
+        } else {
+            [System.Windows.Forms.MessageBox]::Show("Errore durante l'applicazione.","ACK",
+                [System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+        }
+    })
+    $btnRevert.Add_Click({
+        $targets = if ($chkAll.Checked) { $adapters | ForEach-Object Name } else { @($adapters[$cmbNic.SelectedIndex].Name) }
+        if (Revert-Ack -NicNames $targets) {
+            [System.Windows.Forms.MessageBox]::Show("ACK Tweaks ripristinati.","ACK",
+                [System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+            RefreshAckStatus
+        } else {
+            [System.Windows.Forms.MessageBox]::Show("Errore nel ripristino.","ACK",
+                [System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+        }
+    })
+    $btnClose.Add_Click({ $dlg.Close() | Out-Null })
+
+    $dlg.ShowDialog() | Out-Null
+}
+function Show-IrqAffinityDialog {
+    $nicData = @(Get-NicsForAffinity)
+    if (-not $nicData -or $nicData.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show("Nessuna NIC attiva trovata.","IRQ & Affinity",
+            [System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+        return
+    }
+
+    $dlg                 = New-Object System.Windows.Forms.Form
+    $dlg.Text            = "IRQ & Affinity"
+    $dlg.Size            = New-Object System.Drawing.Size(470,300)
+    $dlg.StartPosition   = "CenterParent"
+    $dlg.BackColor       = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+    $dlg.Font            = New-Object System.Drawing.Font('Calibri',10)
+    $dlg.ForeColor       = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox     = $false
+    $dlg.MinimizeBox     = $false
+
+    $lblNic              = New-Object System.Windows.Forms.Label
+    $lblNic.Text         = "Seleziona NIC:"
+    $lblNic.Location     = New-Object System.Drawing.Point(15,20)
+    $lblNic.AutoSize     = $true
+    $dlg.Controls.Add($lblNic)
+
+    $cmbNic                   = New-Object System.Windows.Forms.ComboBox
+    $cmbNic.Location          = New-Object System.Drawing.Point(120,16)
+    $cmbNic.Size              = New-Object System.Drawing.Size(320,24)
+    $cmbNic.DropDownStyle     = 'DropDownList'
+    foreach ($n in $nicData) { [void]$cmbNic.Items.Add("{0} - {1}" -f $n.Name,$n.IfDesc) }
+    if ($cmbNic.Items.Count -gt 0) { $cmbNic.SelectedIndex = 0 }
+    $dlg.Controls.Add($cmbNic)
+
+    $grpPreset                = New-Object System.Windows.Forms.GroupBox
+    $grpPreset.Text           = "Preset"
+    $grpPreset.Location       = New-Object System.Drawing.Point(15,55)
+    $grpPreset.Size           = New-Object System.Drawing.Size(425,85)
+    $grpPreset.ForeColor      = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+    $dlg.Controls.Add($grpPreset)
+
+    $presetMap = [ordered]@{
+        'Intel I226'                  = 'IntelI226'
+        'Intel I225 (RSS/MSI only)'   = 'IntelI225'
+        'Intel 2.5G (I219/I225/I226)' = 'Intel2p5G'
+        'Killer E3100G (I225)'        = 'KillerE3100G'
+        'Realtek 8111H (1GbE)'        = 'Realtek8111H'
+        'Realtek 8125 (2.5GbE)'       = 'Realtek8125'
+        'Realtek 8126 (5GbE)'         = 'Realtek8126'
+        'Aquantia/Marvell AQC107'     = 'AQC107'
+    }
+
+    $cmbPreset = New-Object System.Windows.Forms.ComboBox
+    $cmbPreset.Location      = New-Object System.Drawing.Point(15,30)
+    $cmbPreset.Size          = New-Object System.Drawing.Size(390,24)
+    $cmbPreset.DropDownStyle = 'DropDownList'
+    foreach ($k in $presetMap.Keys) { [void]$cmbPreset.Items.Add($k) }
+    $cmbPreset.SelectedIndex = 0
+    $grpPreset.Controls.Add($cmbPreset)
+
+    $btnApply                 = New-Object System.Windows.Forms.Button
+    $btnApply.Text            = "Apply Preset"
+    $btnApply.Size            = New-Object System.Drawing.Size(150,30)
+    $btnApply.Location        = New-Object System.Drawing.Point(15,160)
+    $btnApply.ForeColor       = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+    $btnApply.BackColor       = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+    $dlg.Controls.Add($btnApply)
+
+    $btnRevert                = New-Object System.Windows.Forms.Button
+    $btnRevert.Text           = "Revert"
+    $btnRevert.Size           = New-Object System.Drawing.Size(150,30)
+    $btnRevert.Location       = New-Object System.Drawing.Point(175,160)
+    $btnRevert.ForeColor      = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+    $btnRevert.BackColor      = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+    $dlg.Controls.Add($btnRevert)
+
+    $btnClose                 = New-Object System.Windows.Forms.Button
+    $btnClose.Text            = "Close"
+    $btnClose.Size            = New-Object System.Drawing.Size(90,30)
+    $btnClose.Location        = New-Object System.Drawing.Point(335,160)
+    $btnClose.ForeColor       = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+    $btnClose.BackColor       = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+    $dlg.Controls.Add($btnClose)
+
+    $btnApply.Add_Click({
+        $idx = $cmbNic.SelectedIndex
+        if ($idx -lt 0) { return }
+        $nic = $nicData[$idx]
+        $presetKey = $cmbPreset.SelectedItem
+        $preset = $presetMap[$presetKey]
+        if (Apply-IRQPreset -Preset $preset -NicName $nic.Name -PnpId $nic.PNPDeviceID) {
+            [System.Windows.Forms.MessageBox]::Show(("Preset {0} applicato su '{1}'. (MSI=ON, RSS pinned + profilo driver)" -f $presetKey,$nic.Name),"OK",
+                [System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+        } else {
+            [System.Windows.Forms.MessageBox]::Show(("Errore applicando preset {0} su '{1}'." -f $presetKey,$nic.Name),"Errore",
+                [System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+        }
+    })
+
+    $btnRevert.Add_Click({
+        $idx = $cmbNic.SelectedIndex
+        if ($idx -lt 0) { return }
+        $nic = $nicData[$idx]
+        if (Revert-IRQPreset -NicName $nic.Name -PnpId $nic.PNPDeviceID) {
+            [System.Windows.Forms.MessageBox]::Show(("Ripristino completato su '{0}'. (RSS reset, MSI ripristinato se salvato)" -f $nic.Name),"OK",
+                [System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+        } else {
+            [System.Windows.Forms.MessageBox]::Show(("Errore nel ripristino su '{0}'." -f $nic.Name),"Errore",
+                [System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+        }
+    })
+
+    $btnClose.Add_Click({ $dlg.Close() | Out-Null })
+
+    $dlg.ShowDialog() | Out-Null
+}
+
+$btn_IrqAffinityDialog.Add_Click({ Show-IrqAffinityDialog })
+
+function Show-NicExtrasDialog {
+    $nics = @(Get-NicsForExtras)
+    if (-not $nics -or $nics.Count -eq 0) {
+        [System.Windows.Forms.MessageBox]::Show("Nessuna NIC rilevata.","NIC Extras",
+            [System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+        return
+    }
+
+    $dlg                 = New-Object System.Windows.Forms.Form
+    $dlg.Text            = "NIC Extras"
+    $dlg.Size            = New-Object System.Drawing.Size(520,310)
+    $dlg.StartPosition   = "CenterParent"
+    $dlg.BackColor       = [System.Drawing.ColorTranslator]::FromHtml("#171717")
+    $dlg.Font            = New-Object System.Drawing.Font('Calibri',10)
+    $dlg.ForeColor       = [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+    $dlg.FormBorderStyle = 'FixedDialog'
+    $dlg.MaximizeBox     = $false
+    $dlg.MinimizeBox     = $false
+
+    # NIC picker
+    $lblNic = New-Object System.Windows.Forms.Label
+    $lblNic.Text = "Seleziona NIC:"
+    $lblNic.Location = New-Object System.Drawing.Point(15,18)
+    $lblNic.AutoSize = $true
+    $dlg.Controls.Add($lblNic)
+
+    $cmbNic = New-Object System.Windows.Forms.ComboBox
+    $cmbNic.Location = New-Object System.Drawing.Point(120,14)
+    $cmbNic.Size     = New-Object System.Drawing.Size(370,24)
+    $cmbNic.DropDownStyle = 'DropDownList'
+    foreach ($a in $nics) { [void]$cmbNic.Items.Add("{0} - {1}" -f $a.Name,$a.InterfaceDescription) }
+    if ($cmbNic.Items.Count -gt 0) { $cmbNic.SelectedIndex = 0 }
+    $dlg.Controls.Add($cmbNic)
+
+    # Gruppo RSC
+    $grpRSC = New-Object System.Windows.Forms.GroupBox
+    $grpRSC.Text = "RSC (Receive Segment Coalescing - OS)"
+    $grpRSC.Location = New-Object System.Drawing.Point(15,50)
+    $grpRSC.Size     = New-Object System.Drawing.Size(475,70)
+    $grpRSC.ForeColor= [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+    $dlg.Controls.Add($grpRSC)
+
+    $lblRsc = New-Object System.Windows.Forms.Label
+    $lblRsc.Location = New-Object System.Drawing.Point(15,30)
+    $lblRsc.AutoSize = $true
+    $grpRSC.Controls.Add($lblRsc)
+
+    $btnRscOn = New-Object System.Windows.Forms.Button
+    $btnRscOn.Text  = "Enable RSC"
+    $btnRscOn.Size  = New-Object System.Drawing.Size(110,28)
+    $btnRscOn.Location = New-Object System.Drawing.Point(330,28)
+    $btnRscOn.ForeColor= [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+    $btnRscOn.BackColor= [System.Drawing.ColorTranslator]::FromHtml("#171717")
+    $grpRSC.Controls.Add($btnRscOn)
+
+    $btnRscOff = New-Object System.Windows.Forms.Button
+    $btnRscOff.Text  = "Disable RSC"
+    $btnRscOff.Size  = New-Object System.Drawing.Size(110,28)
+    $btnRscOff.Location = New-Object System.Drawing.Point(215,28)
+    $btnRscOff.ForeColor= [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+    $btnRscOff.BackColor= [System.Drawing.ColorTranslator]::FromHtml("#171717")
+    $grpRSC.Controls.Add($btnRscOff)
+
+    # Gruppo Flow Control
+    $grpFC = New-Object System.Windows.Forms.GroupBox
+    $grpFC.Text = "Flow Control (driver)"
+    $grpFC.Location = New-Object System.Drawing.Point(15,130)
+    $grpFC.Size     = New-Object System.Drawing.Size(475,70)
+    $grpFC.ForeColor= [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+    $dlg.Controls.Add($grpFC)
+
+    $lblFc = New-Object System.Windows.Forms.Label
+    $lblFc.Location = New-Object System.Drawing.Point(15,30)
+    $lblFc.AutoSize = $true
+    $grpFC.Controls.Add($lblFc)
+
+    $btnFcOn = New-Object System.Windows.Forms.Button
+    $btnFcOn.Text  = "Flow Control: ON"
+    $btnFcOn.Size  = New-Object System.Drawing.Size(150,28)
+    $btnFcOn.Location = New-Object System.Drawing.Point(290,28)
+    $btnFcOn.ForeColor= [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+    $btnFcOn.BackColor= [System.Drawing.ColorTranslator]::FromHtml("#171717")
+    $grpFC.Controls.Add($btnFcOn)
+
+    $btnFcOff = New-Object System.Windows.Forms.Button
+    $btnFcOff.Text  = "Flow Control: OFF"
+    $btnFcOff.Size  = New-Object System.Drawing.Size(150,28)
+    $btnFcOff.Location = New-Object System.Drawing.Point(130,28)
+    $btnFcOff.ForeColor= [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+    $btnFcOff.BackColor= [System.Drawing.ColorTranslator]::FromHtml("#171717")
+    $grpFC.Controls.Add($btnFcOff)
+
+    function RefreshNicStatus {
+        $idx = $cmbNic.SelectedIndex
+        if ($idx -lt 0) { return }
+        $nic = $nics[$idx]
+        # RSC
+        $rsc = Get-RscStatus -NicName $nic.Name
+        $lblRsc.Text = "Stato RSC: " + ($(if ($rsc.Enabled) { "ENABLED" } else { "DISABLED" }))
+        # Flow Control (mostra valore raw se disponibile)
+        $prop = Get-FlowControlProperty -NicName $nic.Name
+        if ($prop) {
+            $cur = if ($prop.DisplayValue) { $prop.DisplayValue } elseif ($prop.RegistryValue) { $prop.RegistryValue } else { "(n/d)" }
+            $lblFc.Text = "Flow Control corrente: " + $cur
+        } else {
+            $lblFc.Text = "Flow Control non esposto dal driver."
+        }
+    }
+
+    $cmbNic.Add_SelectedIndexChanged({ RefreshNicStatus })
+    RefreshNicStatus
+
+    $btnRscOn.Add_Click({
+        $idx = $cmbNic.SelectedIndex; if ($idx -lt 0) { return }
+        $nic = $nics[$idx]
+        try { Enable-RSC -NicName $nic.Name | Out-Null; RefreshNicStatus }
+        catch {
+            [System.Windows.Forms.MessageBox]::Show($_,"Errore RSC",[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+        }
+    })
+    $btnRscOff.Add_Click({
+        $idx = $cmbNic.SelectedIndex; if ($idx -lt 0) { return }
+        $nic = $nics[$idx]
+        try { Disable-RSC -NicName $nic.Name | Out-Null; RefreshNicStatus }
+        catch {
+            [System.Windows.Forms.MessageBox]::Show($_,"Errore RSC",[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+        }
+    })
+    $btnFcOn.Add_Click({
+        $idx = $cmbNic.SelectedIndex; if ($idx -lt 0) { return }
+        $nic = $nics[$idx]
+        try { Set-FlowControl -NicName $nic.Name -State On | Out-Null; RefreshNicStatus }
+        catch {
+            [System.Windows.Forms.MessageBox]::Show($_,"Errore Flow Control",[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+        }
+    })
+    $btnFcOff.Add_Click({
+        $idx = $cmbNic.SelectedIndex; if ($idx -lt 0) { return }
+        $nic = $nics[$idx]
+        try { Set-FlowControl -NicName $nic.Name -State Off | Out-Null; RefreshNicStatus }
+        catch {
+            [System.Windows.Forms.MessageBox]::Show($_,"Errore Flow Control",[System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+        }
+    })
+
+    # Close
+    $btnClose = New-Object System.Windows.Forms.Button
+    $btnClose.Text  = "Close"
+    $btnClose.Size  = New-Object System.Drawing.Size(90,28)
+    $btnClose.Location = New-Object System.Drawing.Point(400,210)
+    $btnClose.ForeColor= [System.Drawing.ColorTranslator]::FromHtml("#4a90e2")
+    $btnClose.BackColor= [System.Drawing.ColorTranslator]::FromHtml("#171717")
+    $dlg.Controls.Add($btnClose)
+    $btnClose.Add_Click({ $dlg.Close() | Out-Null })
+
+    $dlg.ShowDialog() | Out-Null
+}
+
+$btn_NicExtrasDialog.Add_Click({ Show-NicExtrasDialog })
+
+$btn_MmcssRevert.Add_Click({
+    if (Revert-NdisMmcssOptimizations) {
+        $lbl_Mmcss.Text = Get-MmcssStatusText
+    }
+})
+
+
+
+function Set-ConsoleColor ($bc, $fc) {
+    $Host.UI.RawUI.BackgroundColor = $bc
+    $Host.UI.RawUI.ForegroundColor = $fc
+    Clear-Host
+}
+Set-ConsoleColor 'Black' 'Green'
+
+#Locked Combos
+$cb_AdapterNamesCombo.Flatstyle = 'Flat'
+$cb_rss_onoff.Flatstyle = 'Flat'
+$cb_rssprofile.Flatstyle = 'Flat'
+$cb_rssbaseproc.Flatstyle = 'Flat'
+$cb_rssmaxproc.Flatstyle = 'Flat'
+$cb_rssmaxprocs.Flatstyle = 'Flat'
+$cb_rssqueues.Flatstyle = 'Flat'
+$cb_osrss.Flatstyle = 'Flat'
+$cb_osrsc.Flatstyle = 'Flat'
+$cb_oschimney.Flatstyle = 'Flat'
+$cb_ostaskoff.Flatstyle = 'Flat'
+$cb_osntd.Flatstyle = 'Flat'
+$cb_osntdais.Flatstyle = 'Flat'
+$cb_ospcf.Flatstyle = 'Flat'
+$cb_flowcontrol.Flatstyle = 'Flat'
+$cb_IPChecksumOffloadIPv4.Flatstyle = 'Flat'
+$cb_TCPChecksumOffloadIPv4.Flatstyle = 'Flat'
+$cb_TCPChecksumOffloadIPv6.Flatstyle = 'Flat'
+$cb_UDPChecksumOffloadIPv4.Flatstyle = 'Flat'
+$cb_UDPChecksumOffloadIPv6.Flatstyle = 'Flat'
+$cb_InterruptModeration.Flatstyle = 'Flat'
+$cb_LsoV1IPv4.Flatstyle = 'Flat'
+$cb_LsoV2IPv4.Flatstyle = 'Flat'
+$cb_LsoV2IPv6.Flatstyle = 'Flat'
+$cb_PMARPOffload.Flatstyle = 'Flat'
+$cb_PMNSOffload.Flatstyle = 'Flat'
+$cb_PriorityVLANTag.Flatstyle = 'Flat'
+$cb_ReceiveBuffers.Flatstyle = 'Flat'
+$cb_TransmitBuffers.Flatstyle = 'Flat'
+$cb_InterruptModerationRate.Flatstyle = 'Flat'
+$cb_CoalesceBufferSize.Flatstyle = 'Flat'
+$cb_rss_onoff.DropDownStyle = 'DropDownList'
+$cb_AdapterNamesCombo.DropDownStyle = 'DropDownList'
+$cb_rssprofile.DropDownStyle = 'DropDownList'
+$cb_rssbaseproc.DropDownStyle = 'DropDownList'
+$cb_rssmaxproc.DropDownStyle = 'DropDownList'
+$cb_rssmaxprocs.DropDownStyle = 'DropDownList'
+$cb_rssqueues.DropDownStyle = 'DropDownList'
+$cb_osrss.DropDownStyle = 'DropDownList'
+$cb_osrsc.DropDownStyle = 'DropDownList'
+$cb_oschimney.DropDownStyle = 'DropDownList'
+$cb_ostaskoff.DropDownStyle = 'DropDownList'
+$cb_osntd.DropDownStyle = 'DropDownList'
+$cb_osntdais.DropDownStyle = 'DropDownList'
+$cb_ospcf.DropDownStyle = 'DropDownList'
+$cb_flowcontrol.DropDownStyle = 'DropDownList'
+$cb_IPChecksumOffloadIPv4.DropDownStyle = 'DropDownList'
+$cb_TCPChecksumOffloadIPv4.DropDownStyle = 'DropDownList'
+$cb_TCPChecksumOffloadIPv6.DropDownStyle = 'DropDownList'
+$cb_UDPChecksumOffloadIPv4.DropDownStyle = 'DropDownList'
+$cb_UDPChecksumOffloadIPv6.DropDownStyle = 'DropDownList'
+$cb_InterruptModeration.DropDownStyle = 'DropDownList'
+$cb_LsoV1IPv4.DropDownStyle = 'DropDownList'
+$cb_LsoV2IPv4.DropDownStyle = 'DropDownList'
+$cb_LsoV2IPv6.DropDownStyle = 'DropDownList'
+$cb_PMARPOffload.DropDownStyle = 'DropDownList'
+$cb_PMNSOffload.DropDownStyle = 'DropDownList'
+$cb_PriorityVLANTag.DropDownStyle = 'DropDownList'
+#$cb_CoalesceBufferSize.DropDownStyle = 'DropDownList'
+
+
+$cb_Afd_defaultrecWin.Flatstyle = 'Flat'
+$cb_Afd_defaultSendWin.Flatstyle = 'Flat'
+$cb_BufferMultiplier.Flatstyle = 'Flat'
+$cb_DisableAddressSharing.Flatstyle = 'Flat'
+$cb_BufferAlignment.Flatstyle = 'Flat'
+$cb_DoNotHoldNICBuffers.Flatstyle = 'Flat'
+$cb_SmallBufferSize.Flatstyle = 'Flat'
+$cb_MediumBufferSize.Flatstyle = 'Flat'
+$cb_LargeBufferSize.Flatstyle = 'Flat'
+$cb_HugeBufferSize.Flatstyle = 'Flat'
+$cb_SmallBufferListDepth.Flatstyle = 'Flat'
+$cb_MediumBufferListDepth.Flatstyle = 'Flat'
+$cb_LargBufferListDepth.Flatstyle = 'Flat'
+$cb_DisableChainedReceive.Flatstyle = 'Flat'
+$cb_DisableDirectAcceptEx.Flatstyle = 'Flat'
+$cb_DisableRawSecurity.Flatstyle = 'Flat'
+$cb_DynamicSendBufferDisable.Flatstyle = 'Flat'
+$cb_FastSendDatagramThreshold.Flatstyle = 'Flat'
+$cb_FastCopyReceiveThreshold.Flatstyle = 'Flat'
+$cb_IgnorePushBitOnReceives.Flatstyle = 'Flat'
+$cb_IgnoreOrderlyRelease.Flatstyle = 'Flat'
+$cb_TransmitWorker.Flatstyle = 'Flat'
+$cb_PriorityBoost.Flatstyle = 'Flat'
+
+$cb_DisablePortScaling.Flatstyle = 'Flat'
+$cb_ManyCoreScaling.Flatstyle = 'Flat'
+$cb_DisablePortScaling.DropDownStyle = 'DropDownList'
+$cb_ManyCoreScaling.DropDownStyle = 'DropDownList'
+
+$cb_PacketDirect.Flatstyle = 'Flat'
+$cb_PacketDirect.DropDownStyle = 'DropDownList'
+
+$cb_EnableCoalesce.Flatstyle = 'Flat'
+$cb_EnableCoalesce.DropDownStyle = 'DropDownList'
+$cb_EnableUdpTxScaling.Flatstyle = 'Flat'
+$cb_EnableUdpTxScaling.DropDownStyle = 'DropDownList'
+
+$cb_EnablePME.Flatstyle = 'Flat'
+$cb_EnableDynamicPowerGating.Flatstyle = 'Flat'
+$cb_EnableConnectedPowerGating.Flatstyle = 'Flat'
+$cb_AutoPowerSaveModeEnabled.Flatstyle = 'Flat'
+$cb_NicAutoPowerSaver.Flatstyle = 'Flat'
+$cb_DisableDelayedPowerUp.Flatstyle = 'Flat'
+$cb_ReduceSpeedOnPowerDown.Flatstyle = 'Flat'
+$cb_EnablePME.DropDownStyle = 'DropDownList'
+$cb_EnableDynamicPowerGating.DropDownStyle = 'DropDownList'
+$cb_EnableConnectedPowerGating.DropDownStyle = 'DropDownList'
+$cb_AutoPowerSaveModeEnabled.DropDownStyle = 'DropDownList'
+$cb_NicAutoPowerSaver.DropDownStyle = 'DropDownList'
+$cb_DisableDelayedPowerUp.DropDownStyle = 'DropDownList'
+$cb_ReduceSpeedOnPowerDown.DropDownStyle = 'DropDownList'
+
+$cb_DevicePolicy.Flatstyle = 'Flat'
+$cb_MsiMode.Flatstyle = 'Flat'
+$cb_InterruptPriority.Flatstyle = 'Flat'
+$cb_MsiMode.DropDownStyle = 'DropDownList'
+$cb_InterruptPriority.DropDownStyle = 'DropDownList'
+$cb_DevicePolicy.DropDownStyle = 'DropDownList'
+$cb_MsiMode.Enabled = $false
+$cb_InterruptPriority.Enabled = $false
+$lb_DevicePolicy.Enabled = $false
+$cb_DevicePolicy.Enabled = $false
+$btn_InterruptApply.Enabled = $false
+
+$cb_AdvertiseDefaultRoute.Flatstyle = 'Flat'
+$cb_Advertising.Flatstyle = 'Flat'
+$cb_AutomaticMetric.Flatstyle = 'Flat'
+$cb_ClampMss.Flatstyle = 'Flat'
+$cb_DirectedMacWolPattern.Flatstyle = 'Flat'
+$cb_EcnMarking.Flatstyle = 'Flat'
+$cb_ForceArpNdWolPattern.Flatstyle = 'Flat'
+$cb_Forwarding.Flatstyle = 'Flat'
+$cb_IgnoreDefaultRoutes.Flatstyle = 'Flat'
+$cb_ManagedAddressConfiguration.Flatstyle = 'Flat'
+$cb_NeighborDiscoverySupported.Flatstyle = 'Flat'
+$cb_NeighborUnreachabilityDetection.Flatstyle = 'Flat'
+$cb_OtherStatefulConfiguration.Flatstyle = 'Flat'
+$cb_RouterDiscovery.Flatstyle = 'Flat'
+$cb_Store.Flatstyle = 'Flat'
+$cb_WeakHostReceive.Flatstyle = 'Flat'
+$cb_WeakHostSend.Flatstyle = 'Flat'
+$cb_AdvertiseDefaultRoute.DropDownStyle = 'DropDownList'
+$cb_Advertising.DropDownStyle = 'DropDownList'
+$cb_AutomaticMetric.DropDownStyle = 'DropDownList'
+$cb_ClampMss.DropDownStyle = 'DropDownList'
+$cb_DirectedMacWolPattern.DropDownStyle = 'DropDownList'
+$cb_EcnMarking.DropDownStyle = 'DropDownList'
+$cb_ForceArpNdWolPattern.DropDownStyle = 'DropDownList'
+$cb_Forwarding.DropDownStyle = 'DropDownList'
+$cb_IgnoreDefaultRoutes.DropDownStyle = 'DropDownList'
+$cb_ManagedAddressConfiguration.DropDownStyle = 'DropDownList'
+$cb_NeighborDiscoverySupported.DropDownStyle = 'DropDownList'
+$cb_NeighborUnreachabilityDetection.DropDownStyle = 'DropDownList'
+$cb_OtherStatefulConfiguration.DropDownStyle = 'DropDownList'
+$cb_RouterDiscovery.DropDownStyle = 'DropDownList'
+$cb_Store.DropDownStyle = 'DropDownList'
+$cb_WeakHostReceive.DropDownStyle = 'DropDownList'
+$cb_WeakHostSend.DropDownStyle = 'DropDownList'
+
+# ========================================================
+
+# Loading at Startup Global Settings (OS Settings not Adapter specific)
+$cb_osrss.text = (Get-NetOffloadGlobalSetting | select -expand ReceiveSideScaling)
+$cb_osrsc.text = (Get-NetOffloadGlobalSetting | select -expand ReceiveSegmentCoalescing)
+$cb_oschimney.text = (Get-NetOffloadGlobalSetting | select -expand Chimney)
+$cb_ostaskoff.text = (Get-NetOffloadGlobalSetting | select -expand TaskOffload)
+$cb_osntd.text = (Get-NetOffloadGlobalSetting | select -expand NetworkDirect)
+$cb_osntdais.text = (Get-NetOffloadGlobalSetting | select -expand NetworkDirectAcrossIPSubnets)
+$cb_ospcf.text = (Get-NetOffloadGlobalSetting | select -expand PacketCoalescingFilter)
+
+# ========================================================
+# RSS Global
+$ErrorActionPreference = "SilentlyContinue"
+$Global:TCPIP_RegPath = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters"
+$Global:NDIS_RegPath = "HKLM:\SYSTEM\CurrentControlSet\Services\NDIS\Parameters"
+
+$TCPIP_RssBaseCpu = (Get-ItemPropertyValue -Path "$TCPIP_RegPath" -Name "RssBaseCpu" -ErrorAction SilentlyContinue)
+if ($TCPIP_RssBaseCpu -eq $null)
+    {
+        $cb_tcpiprssbasecpu.text = '0'
+    }
+    else
+    {
+        $cb_tcpiprssbasecpu.text = $TCPIP_RssBaseCpu
+    }
+$NDIS_RssBaseCpu = (Get-ItemPropertyValue -Path "$NDIS_RegPath" -Name "RssBaseCpu"-ErrorAction SilentlyContinue)
+if ($NDIS_RssBaseCpu -eq $null)
+    {
+        $cb_ndisrssbasecpu.text = '0'
+    }
+    else
+    {
+        $cb_ndisrssbasecpu.text = $NDIS_RssBaseCpu
+    }
+    
+$TCPIPRssBaseCpuValue = ($cb_tcpiprssbasecpu.text)
+$NDISRssBaseCpuValue = ($cb_ndisrssbasecpu.text)
+$cb_tcpiprssbasecpu.add_TextChanged({
+    Write-Host "TCP/IP - RSSBaseCpu = "$cb_tcpiprssbasecpu.text
+    Set-ItemProperty -Path "$TCPIP_RegPath" -Name "RssBaseCpu" -Value $cb_tcpiprssbasecpu.text -Type DWord -Force})
+$cb_ndisrssbasecpu.add_TextChanged({
+    Write-Host "NDIS - RSSBaseCpu = "$cb_ndisrssbasecpu.text
+    Set-ItemProperty -Path "$NDIS_RegPath" -Name "RssBaseCpu" -Value $cb_ndisrssbasecpu.text -Type DWord -Force})
+
+#$cb_tcpiprssbasecpu.TextChanged = (Set-ItemProperty -Path "$TCPIP_RegPath" -Name "RssBaseCpu" -Value $TCPIPRssBaseCpuValue -Type DWord -Force)
+#$cb_ndisrssbasecpu.TextChanged = (Set-ItemProperty -Path "$NDIS_RegPath" -Name "RssBaseCpu" -Value $NDISRssBaseCpuValue -Type DWord -Force)
+
+# ========================================================
+# Apply Button Global Settings
+function applyglobal { 
+    #cls
+    if ($cb_osrss.text -eq (Get-NetOffloadGlobalSetting | select -expand ReceiveSideScaling))
+    {
+        #Write-Host " ReceiveSideScaling same as Current, skipping." -ForegroundColor green
+    }
+    else
+    {
+        Write-Host "Applying ReceiveSideScaling to"$cb_osrss.text -ForegroundColor Green
+        Set-NetOffloadGlobalSetting -ReceiveSideScaling $cb_osrss.text
+        $cb_osrss.text = (Get-NetOffloadGlobalSetting | select -expand ReceiveSideScaling)
+    }
+    
+    if ($cb_osrsc.text -eq (Get-NetOffloadGlobalSetting | select -expand ReceiveSegmentCoalescing))
+    {
+        #Write-Host " ReceiveSegmentCoalescing same as Current, skipping." -ForegroundColor green
+    }
+    else
+    {
+        Write-Host "Applying ReceiveSegmentCoalescing to"$cb_osrsc.text -ForegroundColor Green
+        Set-NetOffloadGlobalSetting -ReceiveSegmentCoalescing $cb_osrsc.text
+        $cb_osrsc.text = (Get-NetOffloadGlobalSetting | select -expand ReceiveSegmentCoalescing)
+    }
+
+    if ($cb_oschimney.text -eq (Get-NetOffloadGlobalSetting | select -expand Chimney))
+    {
+        #Write-Host " Chimney same as Current, skipping." -ForegroundColor green
+    }
+    else
+    {
+        Write-Host "Applying Chimney to"$cb_oschimney.text -ForegroundColor Green
+        Set-NetOffloadGlobalSetting -Chimney $cb_oschimney.text
+        $cb_oschimney.text = (Get-NetOffloadGlobalSetting | select -expand Chimney)
+    }
+    
+    if ($cb_ostaskoff.text -eq (Get-NetOffloadGlobalSetting | select -expand TaskOffload))
+    {
+        #Write-Host " TaskOffload same as Current, skipping." -ForegroundColor green
+    }
+    else
+    {
+        Write-Host "Applying TaskOffload to"$cb_ostaskoff.text -ForegroundColor Green
+        Set-NetOffloadGlobalSetting -TaskOffload $cb_ostaskoff.text
+        $cb_ostaskoff.text = (Get-NetOffloadGlobalSetting | select -expand TaskOffload)
+    }
+    
+    if ($cb_osntd.text -eq (Get-NetOffloadGlobalSetting | select -expand NetworkDirect))
+    {
+        #Write-Host " NetworkDirect same as Current, skipping." -ForegroundColor green
+    }
+    else
+    {
+        Write-Host "Applying NetworkDirect to"$cb_osntd.text -ForegroundColor Green
+        #Set-NetOffloadGlobalSetting -NetworkDirect $cb_osntd.text
+        Apply_NetworkDirect
+        $cb_osntd.text = (Get-NetOffloadGlobalSetting | select -expand NetworkDirect)
+    }
+    
+    if ($cb_osntdais.text -eq (Get-NetOffloadGlobalSetting | select -expand NetworkDirectAcrossIPSubnets))
+    {
+        #Write-Host " NetworkDirectAcrossIPSubnets same as Current, skipping." -ForegroundColor green
+    }
+    else
+    {
+        Write-Host "Applying NetworkDirectAcrossIPSubnets to"$cb_osntdais.text -ForegroundColor Green
+        ##Bypass
+        ##Set-NetOffloadGlobalSetting -NetworkDirectAcrossIPSubnets $cb_osntdais.text
+        Apply_NetworkDirectGlobalFlags
+        $cb_osntdais.text = (Get-NetOffloadGlobalSetting | select -expand NetworkDirectAcrossIPSubnets)
+    }
+    
+    if ($cb_ospcf.text -eq (Get-NetOffloadGlobalSetting | select -expand PacketCoalescingFilter))
+    {
+        #Write-Host " PacketCoalescingFilter same as Current, skipping." -ForegroundColor green
+    }
+    else
+    {
+        Write-Host "Applying PacketCoalescingFilter to"$cb_ospcf.text -ForegroundColor Green
+        Set-NetOffloadGlobalSetting -PacketCoalescingFilter $cb_ospcf.text
+        $cb_ospcf.text = (Get-NetOffloadGlobalSetting | select -expand PacketCoalescingFilter)
+    }
+}
+
+function Apply_NetworkDirect{
+$NetworkDirectAvaible = ((Get-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\NDIS\Parameters").PSObject.Properties.Name -contains "NetworkDirectDisable")
+	if ($NetworkDirectAvaible -eq $false -and $cb_osntd.Text -eq 'Disabled' ){
+		    #Write-Host "Creating NetworkDirect DWORD with Value $($cb_osntd.Text)."  -ForegroundColor Green
+		    New-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\NDIS\Parameters" -Name "NetworkDirectDisable" -Typ "Dword" -Value "1"
+		}else{
+			#Write-Host "Removing NetworkDirect DWORD"
+			Remove-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\NDIS\Parameters" -Name "NetworkDirectDisable"
+		}
+}
+
+function Apply_NetworkDirectGlobalFlags{
+$NetworkDirectGlobalFlags = ((Get-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\NDIS\Parameters").PSObject.Properties.Name -contains "NetworkDirectGlobalFlags")
+	if ($NetworkDirectGlobalFlags -eq $false -and $cb_osntdais.Text -eq 'Allowed' ){
+		    New-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\NDIS\Parameters" -Name "NetworkDirectGlobalFlags" -Typ "Dword" -Value "1"
+		}else{
+			Remove-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\NDIS\Parameters" -Name "NetworkDirectGlobalFlags"
+		}
+}
+
+
+
+#Adapter Selection
+$AdapterName = Get-NetAdapter -physical | where status -eq 'up' | Select -expand InterfaceDescription
+#$AdapterName = Get-NetAdapter -IncludeHidden | Select -expand InterfaceDescription
+#if($AdapterName )
+@($AdapterName) | ForEach-Object {[void] $cb_AdapterNamesCombo.Items.Add($_)}
+
+function UpdateNicContext {
+    try {
+        # 1) NIC selezionata
+        $Global:NIC_Desc = $cb_AdapterNamesCombo.Text
+        if ([string]::IsNullOrWhiteSpace($Global:NIC_Desc)) { return }
+
+        # 2) Oggetti di base
+        $adapter = Get-NetAdapter -InterfaceDescription $Global:NIC_Desc -ErrorAction Stop
+        $Global:NIC_ALIAS = $adapter.Name
+        $Global:NetConnectionID = $adapter.Name
+        $lbl_ndisver.Text = $adapter.NdisVersion
+
+        # 3) DeviceID -> AdapterDeviceNumber
+        $PhysicalAdapter = Get-WmiObject -Class Win32_NetworkAdapter | Where-Object { $_.Name -like "$NIC_Desc" }
+        if (-not $PhysicalAdapter) { return }
+
+        $DeviceID = [int]$PhysicalAdapter.DeviceID
+        if ($DeviceID -lt 10) {
+            $AdapterDeviceNumber = "000$DeviceID"
+        } else {
+            $AdapterDeviceNumber = "00$DeviceID"
+        }
+
+        # 4) Path di registro dell'adattatore
+        $Global:KeyPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4D36E972-E325-11CE-BFC1-08002bE10318}\$AdapterDeviceNumber"
+        if (Test-Path -Path $KeyPath) {
+            $lbl_Path.Text = $KeyPath
+        } else {
+            $lbl_Path.Text = "(path non trovato)"
+        }
+
+        # 5) NetIPInterface base
+        if (-not $Global:AddressFamily) { $Global:AddressFamily = 'IPv4' }
+        $iface = Get-NetIPInterface -InterfaceAlias $Global:NIC_ALIAS -AddressFamily $Global:AddressFamily -ErrorAction SilentlyContinue | Select-Object -First 1
+
+        # 6) RSS status
+        $rssstatus = (Get-NetAdapterRss -Name $Global:NIC_ALIAS -ErrorAction SilentlyContinue).Enabled
+        if ($rssstatus -eq $true) { $cb_rss_onoff.Text = "Enable" }
+        elseif ($rssstatus -eq $false) { $cb_rss_onoff.Text = "Disable" }
+        else { $cb_rss_onoff.Text = "Unknown" }
+
+        # RSS Queues enum dal registry driver
+        try {
+            $ndiEnum = Get-Item -Path "$KeyPath\Ndi\Params\*NumRssQueues\Enum" -ErrorAction Stop
+            $cb_rssqueues.Items.Clear()
+            foreach ($p in $ndiEnum.Property) { [void]$cb_rssqueues.Items.Add($p) }
+            $defQueue = (Get-ItemProperty "$KeyPath\Ndi\Params\*NumRssQueues" -Name "default" -ErrorAction SilentlyContinue).default
+            if ($defQueue) { $cb_rssqueues.Text = $defQueue }
+        } catch { }
+
+        # 7) Flow Control
+        try {
+            if (Get-Command -Name Get-FlowControlProperty -ErrorAction SilentlyContinue) {
+                $fc = Get-FlowControlProperty -NicName $Global:NIC_ALIAS
+                if ($fc -and $fc.DisplayValue) { $cb_flowcontrol.Text = $fc.DisplayValue }
+            }
+        } catch { }
+
+        # 8) RSC Status
+        try {
+            if (Get-Command -Name Get-RscStatus -ErrorAction SilentlyContinue) {
+                $rsc = Get-RscStatus
+                # se hai un controllo dedicato per RSC, aggiornalo qui
+            }
+        } catch { }
+
+        # 9) QoS List
+        if (Get-Command -Name Refresh-QoSListBox -ErrorAction SilentlyContinue) {
+            Refresh-QoSListBox
+        }
+
+        # 10) Altri refresh lato destra custom
+        if (Get-Command -Name Refresh-RightPaneForNic -ErrorAction SilentlyContinue) {
+            Refresh-RightPaneForNic -NicAlias $Global:NIC_ALIAS -KeyPath $Global:KeyPath
+        }
+
+        # 11) Refresh sempre della sezione Interface Settings
+        RefreshingNetIPInterfaceSettings
+
+        Load-TcpOsOffloadsSettings
+
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show(
+            "Errore aggiornando NIC: $($_.Exception.Message)","Errore",
+            [System.Windows.Forms.MessageBoxButtons]::OK,
+            [System.Windows.Forms.MessageBoxIcon]::Error
+        ) | Out-Null
+    }
+}
+    $PhysicalAdapter = Get-WmiObject -Class Win32_NetworkAdapter|Where-Object{$_.Name -like "$NIC_Desc"} 
+            $PhysicalAdapterName = $PhysicalAdapter.Name
+            $DeviceID = $PhysicalAdapter.DeviceID
+                If([Int32]$DeviceID -lt 10)
+		        {
+			    $AdapterDeviceNumber = "000"+$DeviceID
+		        }
+		        Else
+		        {
+			    $AdapterDeviceNumber = "00"+$DeviceID
+		        }
+		    
+		    $Global:EthernetClassGuid = Get-WmiObject Win32_PnPEntity | Where-Object{$_.Name -like "$NIC_Desc" } | Select -expand ClassGuid
+            $Global:EthernetPNPDeviceID = Get-WmiObject Win32_PnPEntity | Where-Object{$_.Name -like "$NIC_Desc" } | Select -expand PNPDeviceID
+		    $Global:NetConnectionID = Get-WmiObject -Class Win32_NetworkAdapter | Where-Object{$_.Name -like "$NIC_Desc" } | Select -expand NetConnectionID 
+    #check whether the registry path exists.
+		#SupressTerminationErrors
+		$ErrorActionPreference="SilentlyContinue"
+		
+		$Global:KeyPath = "HKLM:\SYSTEM\CurrentControlSet\Control\Class\{4D36E972-E325-11CE-BFC1-08002bE10318}\$AdapterDeviceNumber"
+		If(Test-Path -Path $KeyPath)
+		{
+			Write-Host "Path found at ($KeyPath)."
+			$lbl_Path.Text = $KeyPath
+		}
+		Else
+		{
+			Write-Warning "The path ($KeyPath) not found."
+		}
+		#RSS Enabled or Not
+		$Global:rssstatus = (Get-NetAdapterRss).Enabled
+		if($rssstatus -eq 'True')
+		        {
+		        $cb_rss_onoff.Text = "Enable"
+		        }
+		        else
+		        {
+		        $cb_rss_onoff.Text = "Disable"
+		        }
+		if($rssstatus -eq $Null )
+		        {
+		            Write-Warning "RSS is handled by OS, because of Network Driver!"
+		            $btn_rssaddsupport.Enabled = $true
+		            #$cb_rssqueues.Enabled = $False
+		            #$cb_rssprofile.Enabled = $False
+		            #$cb_rssbaseproc.Enabled = $False
+		            #$cb_rssmaxproc.Enabled = $False
+		            #$cb_rssmaxprocs.Enabled = $False
+		        }
+		        else
+		        {
+		            $cb_rssqueues.Enabled = $true
+		            $cb_rssprofile.Enabled = $true
+		            $cb_rssbaseproc.Enabled = $true
+		            $cb_rssmaxproc.Enabled = $true
+		            $cb_rssmaxprocs.Enabled = $true
+		            $btn_rssaddsupport.Enabled = $false
+		        }
+		  if($cb_rss_onoff.Text -eq 'Enable')
+		    {
+		        $Global:Rssstatusset = ($True)
+		    }
+		    else
+		    {
+		        $Global:Rssstatusset = ($False)
+		    }
+		    
+		#IPv6 Disabled?
+		$IPv6_1 = (Get-ItemPropertyValue -Path "REGISTRY::HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters" -Name "DisabledComponents")
+		$IPv6_2 = (Get-ItemPropertyValue -Path "REGISTRY::HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\Tcpip6\Parameters" -Name "EnableICSIPv6")
+		
+		if ($IPv6_1 -eq "255" -and $IPv6_2 -eq "0"){
+		     Write-Warning  "IPv6 is Disabled by Registry."  -ForegroundColor Green
+		     $cb_IPv6.Checked = $False
+		     $cb_IPv6.Enabled = $False
+		     $cb_IPv6.Visible = $False
+		     $cb_IPv4.Checked = $True
+		     $Global:AddressFamily = "IPv4"
+		     }else{
+		      Write-Warning  "IPv4/IPv6 is Enabled by Registry. Selecting IPv4 as Default for AddressFamily"  -ForegroundColor Green
+		      $cb_IPv4.Checked = $true
+		      $cb_IPv6.Checked = $false
+		      $Global:AddressFamily = "IPv4"
+		     }
+		
+		#RSS Queues
+		#Query Available RSSQueues
+		$AdapterQueuesRegTest = (Test-Path -Path "$KeyPath\Ndi\Params\*NumRssQueues\Enum")
+		if($rssstatus -eq $null -Or $cb_rssqueues.Items.Count -eq '0' -and $AdapterQueuesRegTest -eq $false){
+		    #Write-Host "Powershell"
+		    $Global:AdapterQueues = Get-NetAdapterRss -InterfaceDescription $NIC_Desc | select -expand NumberOfReceiveQueues
+		    $cb_rssqueues.Items.Add($AdapterQueues)
+		    $cb_rssqueues.Text = $AdapterQueues
+		    }else{
+		    #Write-Host "Registry"
+		    $AdapterQueues = Get-Item -Path "$KeyPath\Ndi\Params\*NumRssQueues\Enum" | Select -ExpandProperty Property
+            @($AdapterQueues) | ForEach-Object {[void] $cb_rssqueues.Items.Add($_)}
+		    $AdapterQueues = Get-ItemProperty -Path "$KeyPath\Ndi\Params\*NumRssQueues" -Name "Default" | Select -expand Default
+		    $cb_rssqueues.Text = $AdapterQueues
+		    }
+		    
+		    #$RegistryQueues = Get-ItemPropertyValue -Path "$KeyPath\Ndi\Params\*NumRssQueues" -Name "Default" | Select -expand Default
+		    #$PowershellQueues = Get-NetAdapterRss -InterfaceDescription $NIC_Desc | select -expand NumberOfReceiveQueues
+		    #if($RegistryQueues -eq $PowershellQueues){
+		    #    Write-Host "NumberOfReceiveQueues is equal."
+		    #}else{
+		    #    Write-Warning "NumberOfReceiveQueues is not the same. (Powershell and Registry not equal!) Using Registry Value."
+		    #}
+
+        #RSS Profiles
+        $OSRSSProfiles = [Microsoft.PowerShell.Cmdletization.GeneratedTypes.NetAdapterRss.Profile].GetEnumValues()
+        @($OSRSSProfiles) | ForEach-Object {[void] $cb_rssprofile.Items.Add($_)}
+        $cb_rssprofile.Text = Get-NetAdapterRss | Select -ExpandProperty Profile
+        
+        #RSS BaseProc
+        $cb_rssbaseproc.Text = Get-NetAdapterRss | Select -ExpandProperty "BaseProcessorNumber"
+        $cb_rssmaxproc.Text = Get-NetAdapterRss | Select -ExpandProperty "MaxProcessorNumber"
+        $cb_rssmaxprocs.Text = Get-NetAdapterRss | Select -ExpandProperty "MaxProcessors"
+        
+        # Network Adapter Advanced Settings
+        #
+        #FlowControl
+        $FlowControl = (Get-ItemPropertyValue -Path "$KeyPath" -Name "*FlowControl")
+        $cb_flowcontrol.SelectedIndex=$FlowControl
+        #IPChecksumOffloadIPv4
+        $IPChecksumOffloadIPv4 = (Get-ItemPropertyValue -Path "$KeyPath" -Name "*IPChecksumOffloadIPv4")
+        $cb_IPChecksumOffloadIPv4.SelectedIndex=$IPChecksumOffloadIPv4
+        #TCPChecksumOffloadIPv4
+        $TCPChecksumOffloadIPv4 = (Get-ItemPropertyValue -Path "$KeyPath" -Name "*TCPChecksumOffloadIPv4")
+        $cb_TCPChecksumOffloadIPv4.SelectedIndex=$TCPChecksumOffloadIPv4
+        #TCPChecksumOffloadIPv6
+        $TCPChecksumOffloadIPv6 = (Get-ItemPropertyValue -Path "$KeyPath" -Name "*TCPChecksumOffloadIPv6")
+        $cb_TCPChecksumOffloadIPv6.SelectedIndex=$TCPChecksumOffloadIPv6
+        #UDPChecksumOffloadIPv4
+        $UDPChecksumOffloadIPv4 = (Get-ItemPropertyValue -Path "$KeyPath" -Name "*UDPChecksumOffloadIPv4")
+        $cb_UDPChecksumOffloadIPv4.SelectedIndex=$UDPChecksumOffloadIPv4
+        #UDPChecksumOffloadIPv6
+        $UDPChecksumOffloadIPv6 = (Get-ItemPropertyValue -Path "$KeyPath" -Name "*UDPChecksumOffloadIPv6")
+        $cb_UDPChecksumOffloadIPv6.SelectedIndex=$UDPChecksumOffloadIPv6
+        #InterruptModeration
+        $InterruptModeration = (Get-ItemPropertyValue -Path "$KeyPath" -Name "*InterruptModeration")
+        $cb_InterruptModeration.SelectedIndex=$InterruptModeration
+        #InterruptModerationRate
+        $InterruptModerationRate = (Get-ItemPropertyValue -Path "$KeyPath" -Name "ITR")
+        $cb_InterruptModerationRate.Text=$InterruptModerationRate
+        #LsoV2IPv4
+        $LsoV2IPv4 = (Get-ItemPropertyValue -Path "$KeyPath" -Name "*LsoV2IPv4")
+        $cb_LsoV2IPv4.SelectedIndex=$LsoV2IPv4
+        #LsoV2IPv6
+        $LsoV2IPv6 = (Get-ItemPropertyValue -Path "$KeyPath" -Name "*LsoV2IPv6")
+        $cb_LsoV2IPv6.SelectedIndex=$LsoV2IPv6
+        #LsoV1IPv4
+        $LsoV1IPv4 = (Get-ItemPropertyValue -Path "$KeyPath" -Name "*LsoV1IPv4")
+        $cb_LsoV1IPv4.SelectedIndex=$LsoV1IPv4
+        #PMARPOffload
+        $PMARPOffload = (Get-ItemPropertyValue -Path "$KeyPath" -Name "*PMARPOffload")
+        $cb_PMARPOffload.SelectedIndex=$PMARPOffload
+        #PMNSOffload
+        $PMNSOffload = (Get-ItemPropertyValue -Path "$KeyPath" -Name "*PMNSOffload")
+        $cb_PMNSOffload.SelectedIndex=$PMNSOffload
+        #PriorityVLANTag
+        $PriorityVLANTag = (Get-ItemPropertyValue -Path "$KeyPath" -Name "*PriorityVLANTag")
+        $cb_PriorityVLANTag.SelectedIndex=$PriorityVLANTag
+        #ReceiveBuffers
+        $ReceiveBuffers = (Get-ItemPropertyValue -Path "$KeyPath" -Name "*ReceiveBuffers")
+        $cb_ReceiveBuffers.Text=$ReceiveBuffers
+        #TransmitBuffers
+        $TransmitBuffers = (Get-ItemPropertyValue -Path "$KeyPath" -Name "*TransmitBuffers")
+        $cb_TransmitBuffers.Text=$TransmitBuffers
+        #TxIntDelay
+        $TxIntDelay = (Get-ItemPropertyValue -Path "$KeyPath" -Name "TxIntDelay")
+        $tb_TxIntDelay.Text=$TxIntDelay
+        #PacketDirect
+        $PacketDirect = (Get-ItemPropertyValue -Path "$KeyPath" -Name "*PacketDirect")
+        if($PacketDirect -eq $null){
+            $cb_PacketDirect.Text="Undefined"
+        }else{
+            $cb_PacketDirect.SelectedIndex=$PacketDirect}
+        #EnableCoalesce ( Default Enabled )
+        $EnableCoalesce = (Get-ItemPropertyValue -Path "$KeyPath" -Name "EnableCoalesce")
+        if($EnableCoalesce -eq $null){
+            $cb_EnableCoalesce.Text="Enabled"
+        }else{
+            $cb_EnableCoalesce.SelectedIndex=$EnableCoalesce}
+        #CoalesceBufferSize ( Default 2048 )
+        $CoalesceBufferSize = (Get-ItemPropertyValue -Path "$KeyPath" -Name "CoalesceBufferSize")
+        if($CoalesceBufferSize -eq $null){
+            $cb_CoalesceBufferSize.Text="2048"
+        }else{
+            $cb_CoalesceBufferSize.Text=$CoalesceBufferSize}   
+        #EnableUdpTxScaling
+        $EnableUdpTxScaling = (Get-ItemPropertyValue -Path "$KeyPath" -Name "EnableUdpTxScaling")
+        if($EnableUdpTxScaling -eq $null){
+            $cb_EnableUdpTxScaling.Text="Enabled"
+        }else{
+            $cb_EnableUdpTxScaling.SelectedIndex=$EnableUdpTxScaling}
+
+        #EnablePME
+        $EnablePME = (Get-ItemPropertyValue -Path "$KeyPath" -Name "EnablePME")
+            if ($EnablePME -eq '0' -or $EnablePME -eq '1' ){
+                $cb_EnablePME.SelectedIndex=$EnablePME
+            }else{
+                $cb_EnablePME.Items.Add('Undeclared')
+                $cb_EnablePME.Text = 'Undeclared'
+            }
+        #EnableDynamicPowerGating
+        $EnableDynamicPowerGating = (Get-ItemPropertyValue -Path "$KeyPath" -Name "*EnableDynamicPowerGating")
+            if ($EnableDynamicPowerGating -eq 0 -or $EnableDynamicPowerGating -eq 1 ){
+                $cb_EnableDynamicPowerGating.SelectedIndex=$EnableDynamicPowerGating
+            }else{
+                $cb_EnableDynamicPowerGating.Items.Add('Undeclared')
+                $cb_EnableDynamicPowerGating.Text = 'Undeclared'
+            }
+        #EnableConnectedPowerGating
+        $EnableConnectedPowerGating = (Get-ItemPropertyValue -Path "$KeyPath" -Name "EnableConnectedPowerGating")
+            if ($EnableConnectedPowerGating -eq 0 -or $EnableConnectedPowerGating -eq 1 ){
+                $cb_EnableConnectedPowerGating.SelectedIndex=$EnableConnectedPowerGating
+            }else{
+                $cb_EnableConnectedPowerGating.Items.Add('Undeclared')
+                $cb_EnableConnectedPowerGating.Text = 'Undeclared'
+            }
+    
+        #AutoPowerSaveModeEnabled
+        $AutoPowerSaveModeEnabled = (Get-ItemPropertyValue -Path "$KeyPath" -Name "AutoPowerSaveModeEnabled")
+            if ($AutoPowerSaveModeEnabled -eq 0 -or $AutoPowerSaveModeEnabled -eq 1 ){
+                $cb_AutoPowerSaveModeEnabled.SelectedIndex=$AutoPowerSaveModeEnabled
+            }else{
+                $cb_AutoPowerSaveModeEnabled.Items.Add('Undeclared')
+                $cb_EnableConnectedPowerGating.Text = 'Enabled'
+            }
+            
+        #NicAutoPowerSaver
+        $NicAutoPowerSaver = (Get-ItemPropertyValue -Path "$KeyPath" -Name "*NicAutoPowerSaver")
+            if ($NicAutoPowerSaver -eq 0 -or $NicAutoPowerSaver -eq 1 ){
+                $cb_NicAutoPowerSaver.SelectedIndex=$NicAutoPowerSaver
+            }else{
+                $cb_NicAutoPowerSaver.Items.Add('Undeclared')
+                $cb_NicAutoPowerSaver.Text = 'Undeclared'
+            }
+        
+        #DisableDelayedPowerUp
+        $DisableDelayedPowerUp = (Get-ItemPropertyValue -Path "$KeyPath" -Name "DisableDelayedPowerUp")
+            if ($DisableDelayedPowerUp -eq 0 -or $DisableDelayedPowerUp -eq 1 ){
+                $cb_DisableDelayedPowerUp.SelectedIndex=$DisableDelayedPowerUp
+            }else{
+                $cb_DisableDelayedPowerUp.Items.Add('Undeclared')
+                $cb_DisableDelayedPowerUp.Text = 'Undeclared'
+            }
+        
+        #ReduceSpeedOnPowerDown
+        $ReduceSpeedOnPowerDown = (Get-ItemPropertyValue -Path "$KeyPath" -Name "ReduceSpeedOnPowerDown")
+            if ($ReduceSpeedOnPowerDown -eq 0 -or $ReduceSpeedOnPowerDown -eq 1 ){
+                $cb_ReduceSpeedOnPowerDown.SelectedIndex=$ReduceSpeedOnPowerDown
+            }else{
+                $cb_ReduceSpeedOnPowerDown.Items.Add('Undeclared')
+                $cb_ReduceSpeedOnPowerDown.Text = 'Undeclared'
+            }
+
+        #DefaultSelectiveSuspend (global)
+        try {
+            $dss = (Get-ItemPropertyValue -Path "HKLM:\\SYSTEM\\CurrentControlSet\\Services\\NDIS\\Parameters" -Name "DefaultSelectiveSuspend" -ErrorAction Stop)
+            if ($dss -eq 0 -or $dss -eq 1) {
+                $cb_DefaultSelectiveSuspend.SelectedIndex = $dss
+            } else {
+                $cb_DefaultSelectiveSuspend.Text = 'Skip'
+            }
+        } catch {
+            $cb_DefaultSelectiveSuspend.Text = 'Skip'
+        }
+
+        #PCIe ASPM (current plan)
+        try {
+            $aspmIndex = powercfg -getactivescheme | Select-String -Pattern '{.*}' | ForEach-Object { $_.Matches.Value }
+            $aspmValue = if ($aspmIndex) { powercfg -query $aspmIndex SUB_PCIEXPRESS ASPM | Select-String -Pattern '\\(0x[0-9]+\\)' | Select-Object -First 1 | ForEach-Object { $_.Matches.Value } }
+            switch ($aspmValue) {
+                '(0x0)' { $cb_PcieAspm.SelectedIndex = 0 }
+                '(0x1)' { $cb_PcieAspm.SelectedIndex = 1 }
+                '(0x2)' { $cb_PcieAspm.SelectedIndex = 2 }
+                default { $cb_PcieAspm.Text = 'Skip' }
+            }
+        } catch {
+            $cb_PcieAspm.Text = 'Skip'
+        }
+
+        #Allow device power saving
+        try {
+            $pm = Get-NetAdapterPowerManagement -Name $Global:NetConnectionID -ErrorAction Stop
+            if ($pm.AllowComputerToTurnOffDevice -eq $true) {
+                $cb_DevicePowerSaving.SelectedIndex = 1
+            } elseif ($pm.AllowComputerToTurnOffDevice -eq $false) {
+                $cb_DevicePowerSaving.SelectedIndex = 0
+            }
+        } catch {
+            $cb_DevicePowerSaving.Text = 'Skip'
+        }
+
+        #Allow wake
+        try {
+            $wake = powercfg -devicequery wake_armed
+            if ($wake -and ($wake -contains $Global:NetConnectionID)) {
+                $cb_AllowWake.SelectedIndex = 1
+            } elseif ($wake) {
+                $cb_AllowWake.SelectedIndex = 0
+            }
+        } catch {
+            $cb_AllowWake.Text = 'Skip'
+        }
+
+        #DisablePortScaling
+        $DisablePortScaling = (Get-ItemPropertyValue -Path "$KeyPath" -Name "DisablePortScaling")
+            if ($DisablePortScaling -eq 0 -or $DisablePortScaling -eq 1 ){
+                $cb_DisablePortScaling.SelectedIndex=$DisablePortScaling
+            }else{
+                $cb_DisablePortScaling.Items.Add('Undeclared')
+                $cb_DisablePortScaling.Text = 'Undeclared'
+            }    
+    
+        #ManyCoreScaling
+        $ManyCoreScaling = (Get-ItemPropertyValue -Path "$KeyPath" -Name "ManyCoreScaling")
+            if ($ManyCoreScaling -eq 0 -or $ManyCoreScaling -eq 1 ){
+                $cb_ManyCoreScaling.SelectedIndex=$ManyCoreScaling
+            }else{
+                $cb_ManyCoreScaling.Items.Add('Undeclared')
+                $cb_ManyCoreScaling.Text = 'Undeclared'
+            }
+
+
+#Getting Tweaks Settings
+
+        #AFDDefaultReceiveWindow
+        $AFDDefaultReceiveWindow = (Get-ItemPropertyValue -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "DefaultReceiveWindow")
+        $cb_Afd_defaultRecWin.Text=$AFDDefaultReceiveWindow
+
+        #AFDDefaultSendWindow
+        $AFDDefaultSendWindow = (Get-ItemPropertyValue -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "DefaultSendWindow")
+        $cb_Afd_defaultSendWin.Text=$AFDDefaultSendWindow
+        
+        #BufferMultiplier
+        $AFDBufferMultiplier = (Get-ItemPropertyValue -Path "REGISTRY::HKLM\System\CurrentControlSet\Services\AFD\Parameters" -Name "BufferMultiplier")
+        $cb_BufferMultiplier.Text=$AFDBufferMultiplier
+        
+        #DisableAddressSharing
+        $AFDDisableAddressSharing = (Get-ItemPropertyValue -Path "REGISTRY::HKLM\System\CurrentControlSet\Services\AFD\Parameters" -Name "DisableAddressSharing")
+        $cb_DisableAddressSharing.Text=$AFDDisableAddressSharing
+
+		#BufferAlignment
+        $AFDBufferAlignment = (Get-ItemPropertyValue -Path "REGISTRY::HKLM\System\CurrentControlSet\Services\AFD\Parameters" -Name "BufferAlignment")
+        $cb_BufferAlignment.Text=$AFDBufferAlignment
+        
+    	#DoNotHoldNICBuffers
+        $AFDDoNotHoldNICBuffers = (Get-ItemPropertyValue -Path "REGISTRY::HKLM\System\CurrentControlSet\Services\AFD\Parameters" -Name "DoNotHoldNICBuffers")
+        $cb_DoNotHoldNICBuffers.Text=$AFDDoNotHoldNICBuffers
+
+		#SmallBufferSize
+        $AFDSmallBufferSize = (Get-ItemPropertyValue -Path "REGISTRY::HKLM\System\CurrentControlSet\Services\AFD\Parameters" -Name "SmallBufferSize")
+        $cb_SmallBufferSize.Text=$AFDSmallBufferSize
+
+		#MediumBufferSize
+        $AFDMediumBufferSize = (Get-ItemPropertyValue -Path "REGISTRY::HKLM\System\CurrentControlSet\Services\AFD\Parameters" -Name "MediumBufferSize")
+        $cb_MediumBufferSize.Text=$AFDMediumBufferSize
+        
+		#LargeBufferSize
+        $AFDLargeBufferSize = (Get-ItemPropertyValue -Path "REGISTRY::HKLM\System\CurrentControlSet\Services\AFD\Parameters" -Name "LargeBufferSize")
+        $cb_LargeBufferSize.Text=$AFDLargeBufferSize
+        
+		#HugeBufferSize
+        $AFDHugeBufferSize = (Get-ItemPropertyValue -Path "REGISTRY::HKLM\System\CurrentControlSet\Services\AFD\Parameters" -Name "HugeBufferSize")
+        $cb_HugeBufferSize.Text=$AFDHugeBufferSize        
+        
+        #SmallBufferListDepth
+        $AFDSmallBufferListDepth = (Get-ItemPropertyValue -Path "REGISTRY::HKLM\System\CurrentControlSet\Services\AFD\Parameters" -Name "SmallBufferListDepth")
+        $cb_SmallBufferListDepth.Text=$AFDSmallBufferListDepth
+		
+		#MediumBufferListDepth
+        $AFDMediumBufferListDepth = (Get-ItemPropertyValue -Path "REGISTRY::HKLM\System\CurrentControlSet\Services\AFD\Parameters" -Name "MediumBufferListDepth")
+        $cb_MediumBufferListDepth.Text=$AFDMediumBufferListDepth
+		
+		#LargBufferListDepth
+        $AFDLargBufferListDepth = (Get-ItemPropertyValue -Path "REGISTRY::HKLM\System\CurrentControlSet\Services\AFD\Parameters" -Name "LargBufferListDepth")
+        $cb_LargBufferListDepth.Text=$AFDLargBufferListDepth
+        
+        #DisableChainedReceive
+        $AFDDisableChainedReceive = (Get-ItemPropertyValue -Path "REGISTRY::HKLM\System\CurrentControlSet\Services\AFD\Parameters" -Name "DisableChainedReceive")
+        $cb_DisableChainedReceive.Text=$AFDDisableChainedReceive
+		
+		#DisableDirectAcceptEx
+        $AFDDisableDirectAcceptEx = (Get-ItemPropertyValue -Path "REGISTRY::HKLM\System\CurrentControlSet\Services\AFD\Parameters" -Name "DisableDirectAcceptEx")
+        $cb_DisableDirectAcceptEx.Text=$AFDDisableDirectAcceptEx
+		
+		#DisableRawSecurity
+        $AFDDisableRawSecurity = (Get-ItemPropertyValue -Path "REGISTRY::HKLM\System\CurrentControlSet\Services\AFD\Parameters" -Name "DisableRawSecurity")
+        $cb_DisableRawSecurity.Text=$AFDDisableRawSecurity
+		
+		#DynamicSendBufferDisable
+        $AFDDynamicSendBufferDisable = (Get-ItemPropertyValue -Path "REGISTRY::HKLM\System\CurrentControlSet\Services\AFD\Parameters" -Name "DynamicSendBufferDisable")
+        $cb_DynamicSendBufferDisable.Text=$AFDDynamicSendBufferDisable
+        
+        #FastSendDatagramThreshold
+        $AFDFastSendDatagramThreshold = (Get-ItemPropertyValue -Path "REGISTRY::HKLM\System\CurrentControlSet\Services\AFD\Parameters" -Name "FastSendDatagramThreshold")
+        $cb_FastSendDatagramThreshold.Text=$AFDFastSendDatagramThreshold
+		
+		#FastCopyReceiveThreshold
+        $AFDFastCopyReceiveThreshold = (Get-ItemPropertyValue -Path "REGISTRY::HKLM\System\CurrentControlSet\Services\AFD\Parameters" -Name "FastCopyReceiveThreshold")
+        $cb_FastCopyReceiveThreshold.Text=$AFDFastCopyReceiveThreshold
+        
+        #IgnorePushBitOnReceives
+        $AFDIgnorePushBitOnReceives = (Get-ItemPropertyValue -Path "REGISTRY::HKLM\System\CurrentControlSet\Services\AFD\Parameters" -Name "IgnorePushBitOnReceives")
+        $cb_IgnorePushBitOnReceives.Text=$AFDIgnorePushBitOnReceives
+        
+        #IgnoreOrderlyRelease
+        $AFDIgnoreOrderlyRelease = (Get-ItemPropertyValue -Path "REGISTRY::HKLM\System\CurrentControlSet\Services\AFD\Parameters" -Name "IgnoreOrderlyRelease")
+        $cb_IgnoreOrderlyRelease.Text=$AFDIgnoreOrderlyRelease
+        
+        #TransmitWorker
+        $AFDTransmitWorker = (Get-ItemPropertyValue -Path "REGISTRY::HKLM\System\CurrentControlSet\Services\AFD\Parameters" -Name "TransmitWorker")
+        $cb_TransmitWorker.Text=$AFDTransmitWorker
+        
+         #PriorityBoost
+        $AFDPriorityBoost = (Get-ItemPropertyValue -Path "REGISTRY::HKLM\System\CurrentControlSet\Services\AFD\Parameters" -Name "PriorityBoost")
+        $cb_PriorityBoost.Text=$AFDPriorityBoost
+        
+#NetIPInterface
+        
+        #NetIPInterface
+        #AdvertiseDefaultRoute
+        $AdvertiseDefaultRoute = [Microsoft.PowerShell.Cmdletization.GeneratedTypes.NetIPInterface.AdvertiseDefaultRoute].GetEnumValues()
+        @($AdvertiseDefaultRoute) | ForEach-Object {[void] $cb_AdvertiseDefaultRoute.Items.Add($_)}
+        $cb_AdvertiseDefaultRoute.Text =  Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand AdvertiseDefaultRoute
+            
+        #Advertising
+        $Advertising = [Microsoft.PowerShell.Cmdletization.GeneratedTypes.NetIPInterface.Advertising].GetEnumValues()
+        @($Advertising) | ForEach-Object {[void] $cb_Advertising.Items.Add($_)}
+        $cb_Advertising.Text =  Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand Advertising
+            
+        #AutomaticMetric
+        $AutomaticMetric = [Microsoft.PowerShell.Cmdletization.GeneratedTypes.NetIPInterface.AutomaticMetric].GetEnumValues()
+        @($AutomaticMetric) | ForEach-Object {[void] $cb_AutomaticMetric.Items.Add($_)}
+        $cb_AutomaticMetric.Text =  Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand AutomaticMetric
+            
+        #ClampMss
+        $ClampMss = [Microsoft.PowerShell.Cmdletization.GeneratedTypes.NetIPInterface.ClampMss].GetEnumValues()
+        @($ClampMss) | ForEach-Object {[void] $cb_ClampMss.Items.Add($_)}
+        $cb_ClampMss.Text =  Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand ClampMss
+            
+        #DirectedMacWolPattern
+        $DirectedMacWolPattern = [Microsoft.PowerShell.Cmdletization.GeneratedTypes.NetIPInterface.DirectedMacWolPattern].GetEnumValues()
+        @($DirectedMacWolPattern) | ForEach-Object {[void] $cb_DirectedMacWolPattern.Items.Add($_)}
+        $cb_DirectedMacWolPattern.Text =  Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand DirectedMacWolPattern
+            
+        #EcnMarking
+        $EcnMarking = [Microsoft.PowerShell.Cmdletization.GeneratedTypes.NetIPInterface.EcnMarking].GetEnumValues()
+        @($EcnMarking) | ForEach-Object {[void] $cb_EcnMarking.Items.Add($_)}
+        $cb_EcnMarking.Text =  Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand EcnMarking
+            
+        #ForceArpNdWolPattern
+        $ForceArpNdWolPattern = [Microsoft.PowerShell.Cmdletization.GeneratedTypes.NetIPInterface.ForceArpNdWolPattern].GetEnumValues()
+        @($ForceArpNdWolPattern) | ForEach-Object {[void] $cb_ForceArpNdWolPattern.Items.Add($_)}
+        $cb_ForceArpNdWolPattern.Text =  Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand ForceArpNdWolPattern
+            
+        #Forwarding
+        $Forwarding = [Microsoft.PowerShell.Cmdletization.GeneratedTypes.NetIPInterface.Forwarding].GetEnumValues()
+        @($Forwarding) | ForEach-Object {[void] $cb_Forwarding.Items.Add($_)}
+        $cb_Forwarding.Text =  Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand Forwarding
+            
+        #IgnoreDefaultRoutes
+        $IgnoreDefaultRoutes = [Microsoft.PowerShell.Cmdletization.GeneratedTypes.NetIPInterface.IgnoreDefaultRoutes].GetEnumValues()
+        @($IgnoreDefaultRoutes) | ForEach-Object {[void] $cb_IgnoreDefaultRoutes.Items.Add($_)}
+        $cb_IgnoreDefaultRoutes.Text =  Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand IgnoreDefaultRoutes
+            
+        #ManagedAddressConfiguration
+        $ManagedAddressConfiguration = [Microsoft.PowerShell.Cmdletization.GeneratedTypes.NetIPInterface.ManagedAddressConfiguration].GetEnumValues()
+        @($ManagedAddressConfiguration) | ForEach-Object {[void] $cb_ManagedAddressConfiguration.Items.Add($_)}
+        $cb_ManagedAddressConfiguration.Text =  Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand ManagedAddressConfiguration
+            
+        #NeighborDiscoverySupported
+        $NeighborDiscoverySupported = [Microsoft.PowerShell.Cmdletization.GeneratedTypes.NetIPInterface.NeighborDiscoverySupported].GetEnumValues()
+        @($NeighborDiscoverySupported) | ForEach-Object {[void] $cb_NeighborDiscoverySupported.Items.Add($_)}
+        $cb_NeighborDiscoverySupported.Text =  Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand NeighborDiscoverySupported
+        
+        #NeighborUnreachabilityDetection
+        $NeighborUnreachabilityDetection = [Microsoft.PowerShell.Cmdletization.GeneratedTypes.NetIPInterface.NeighborUnreachabilityDetection].GetEnumValues()
+        @($NeighborUnreachabilityDetection) | ForEach-Object {[void] $cb_NeighborUnreachabilityDetection.Items.Add($_)}
+        $cb_NeighborUnreachabilityDetection.Text =  Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand NeighborUnreachabilityDetection
+        
+        #OtherStatefulConfiguration
+        $OtherStatefulConfiguration = [Microsoft.PowerShell.Cmdletization.GeneratedTypes.NetIPInterface.OtherStatefulConfiguration].GetEnumValues()
+        @($OtherStatefulConfiguration) | ForEach-Object {[void] $cb_OtherStatefulConfiguration.Items.Add($_)}
+        $cb_OtherStatefulConfiguration.Text =  Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand OtherStatefulConfiguration
+        
+        #RouterDiscovery
+        $RouterDiscovery = [Microsoft.PowerShell.Cmdletization.GeneratedTypes.NetIPInterface.RouterDiscovery].GetEnumValues()
+        @($RouterDiscovery) | ForEach-Object {[void] $cb_RouterDiscovery.Items.Add($_)}
+        $cb_RouterDiscovery.Text =  Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand RouterDiscovery
+        
+        #Store
+        $Store = [Microsoft.PowerShell.Cmdletization.GeneratedTypes.NetIPInterface.Store].GetEnumValues()
+        @($Store) | ForEach-Object {[void] $cb_Store.Items.Add($_)}
+        $cb_Store.Text =  Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand Store
+        
+        #WeakHostReceive
+        $WeakHostReceive = [Microsoft.PowerShell.Cmdletization.GeneratedTypes.NetIPInterface.WeakHostReceive].GetEnumValues()
+        @($WeakHostReceive) | ForEach-Object {[void] $cb_WeakHostReceive.Items.Add($_)}
+        $cb_WeakHostReceive.Text =  Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand WeakHostReceive
+        
+        #WeakHostSend
+        $WeakHostSend = [Microsoft.PowerShell.Cmdletization.GeneratedTypes.NetIPInterface.WeakHostSend].GetEnumValues()
+        @($WeakHostSend) | ForEach-Object {[void] $cb_WeakHostSend.Items.Add($_)}
+        $cb_WeakHostSend.Text =  Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand WeakHostSend
+        
+        #CurrentHopLimit
+        #When this parameter value is set to 0, it uses this default.    
+        $tb_CurrentHopLimit.Text = Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand CurrentHopLimit
+        
+        #BaseReachableTime
+        #Specifies the base value for random reachable time, in milliseconds. For more information, see RFC 2461.
+        #The default value is 30000.
+        $tb_BaseReachableTime.Text = Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand BaseReachableTime
+    
+        #ReachableTime
+        #Specifies an array of reachable time values. This parameter is the time, in milliseconds, that a node assumes that a neighbor
+        #is reachable after having received a reachability confirmation. This parameter works with the NeighborUnreachabilityDetection parameter.
+        $tb_ReachableTime.Text = Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand ReachableTime
+
+        #DadRetransmitTime
+        #Specifies a value for the time interval between neighbor solicitation messages.
+        $tb_DadRetransmitTime.Text = Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand DadRetransmitTime
+
+        #DadTransmits
+        #Specifies a value for the number of consecutive messages sent while the network driver performs duplicate address detection.
+        $tb_DadTransmits.Text = Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand DadTransmits
+
+        #NlMtu
+        #Specifies the network layer Maximum Transmission Unit (MTU) value, in bytes, for an IP interface. 
+        #For IPv4 the minimum value is 576 bytes. For IPv6 the minimum is value is 1280 bytes.
+        #For both IPv4 and IPv6, the maximum value is 2^32-1 (4294967295). You cannot set values outside these ranges.
+        #If this parameter is set to 0, then it will remain unchanged and maintain its current value. The IP interface will not transmit packets larger than the maximum value.
+        $tb_NlMtu.Text = Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand NlMtu
+
+        #RetransmitTime (RetransmitTimeMs)
+        #Specifies a value for timeout and retransmission, in milliseconds, for Neighbor Solicitation messages. 
+        #For more information, see RetransTimer in RFC 2461. 
+        #By default, the value is set to 1000.
+        $tb_RetransmitTime.Text = Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand RetransmitTime
+        
+        $PathInterrupt = 'HKEY_LOCAL_MACHINE\System\CurrentControlSet\Enum'
+        #$Global:EthernetClassGuid
+        #$Global:EthernetPNPDeviceID
+        $Global:NewPathInterrupt = "$PathInterrupt\$EthernetPNPDeviceID"
+        $Test = Test-Path REGISTRY::$NewPathInterrupt
+        if ($Test){
+	        $cb_MsiMode.Enabled = $True
+            $cb_InterruptPriority.Enabled = $True
+            $lb_MsiMode.Enabled = $True
+            $lb_InterruptPriority.Enabled = $True
+            $lb_DevicePolicy.Enabled = $True
+            $cb_DevicePolicy.Enabled = $True
+            $btn_InterruptApply.Enabled = $True
+            $MsiModeRegistry = Get-ItemPropertyValue -Path "REGISTRY::$NewPathInterrupt\Device Parameters\Interrupt Management\MessageSignaledInterruptProperties" -Name "MSISupported"
+            if($MsiModeRegistry -eq "1"){
+                $cb_MsiMode.Text = "Enabled"}
+            if($MsiModeRegistry -eq "0"){
+                $cb_MsiMode.Text = "Disabled"}
+            
+            $DevicePriority = Get-ItemPropertyValue -Path "REGISTRY::$NewPathInterrupt\Device Parameters\Interrupt Management\Affinity Policy" -Name "DevicePriority"     
+			$Global:DevicePriorityAvailable = ((Get-ItemProperty -Path "REGISTRY::$NewPathInterrupt\Device Parameters\Interrupt Management\Affinity Policy").PSObject.Properties.Name -contains "DevicePriority")
+            if($DevicePriority -eq "0"){
+                $cb_InterruptPriority.Text = "Undefined"}
+            if($DevicePriority -eq "1"){
+                $cb_InterruptPriority.Text = "Low"}
+            if($DevicePriority -eq "2"){
+                $cb_InterruptPriority.Text = "Normal"}
+            if($DevicePriority -eq "3"){
+                $cb_InterruptPriority.Text = "High"}
+                
+            $DevicePolicy = Get-ItemPropertyValue -Path "REGISTRY::$NewPathInterrupt\Device Parameters\Interrupt Management\Affinity Policy" -Name "DevicePolicy"         
+            #Default Affinity policy, system dependent.
+            if($DevicePolicy -eq "0" -or $DevicePolicy -eq $null){
+                $cb_DevicePolicy.Text = "MachineDefault"}
+            #Target all processors located in same NUMA Node Device.
+            if($DevicePolicy -eq "1"){
+                $cb_DevicePolicy.Text = "AllCloseProcessors"}
+            #Target one processor located in same NUMA Node as Device.
+            if($DevicePolicy -eq "2"){
+                $cb_DevicePolicy.Text = "OneCloseProcessor"}
+            #Target all Processors in machine.
+            if($DevicePolicy -eq "3"){
+                $cb_DevicePolicy.Text = "ProcessorsInMachine"}
+            #Target processors specified in mask, use set Mask.
+            if($DevicePolicy -eq "4"){
+                $cb_DevicePolicy.Text = "SpecifiedProcessors"}
+            #Spread Message-Signaled-Interrupts to different processors, if possible.
+            if($DevicePolicy -eq "5"){
+                $cb_DevicePolicy.Text = "SreadMessagesAcrossAllProcessors"}
+        }
+
+#AddRSSSupport
+function RSSEnable{
+    Write-Host "Enabling RSS Support for "$PhysicalAdapter.Name
+    New-Item "$KeyPath\Ndi\Params\*RSS" -Force
+        
+    New-ItemProperty "$KeyPath\Ndi\Params\*RSS" -Name "ParamDesc" -PropertyTyp "String" -Value "Receive Side Scaling" -Force
+    New-ItemProperty "$KeyPath\Ndi\Params\*RSS" -Name "default" -PropertyTyp "String" -Value "1" -Force
+    New-ItemProperty "$KeyPath\Ndi\Params\*RSS" -Name "type" -PropertyTyp "String" -Value "enum" -Force
+        
+    New-Item "$KeyPath\Ndi\Params\*RSS\Enum" -Force
+    New-ItemProperty "$KeyPath\Ndi\Params\*RSS\Enum" -Name "0" -PropertyTyp "String" -Value "Disabled" -Force
+    New-ItemProperty "$KeyPath\Ndi\Params\*RSS\Enum" -Name "1" -PropertyTyp "String" -Value "Enabled" -Force
+}
+
+
+        function applyadvsettings {
+        #cls
+        #FlowControl
+        if ($cb_flowcontrol.SelectedIndex -eq (Get-ItemPropertyValue -Path "$KeyPath" -Name "*FlowControl")){
+            Write-Host "FlowControl is same then Registry, skipping."  -ForegroundColor green}
+
+            elseif ($cb_flowcontrol.SelectedIndex -eq '0'){
+            Write-Host "Disabling FlowControl"  -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "*FlowControl" -Value "0" -Force}
+            
+            elseif ($cb_flowcontrol.SelectedIndex -eq '1'){
+            Write-Host "Enabling Tx for FlowControl" -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "*FlowControl" -Value "1" -Force}
+            
+            elseif ($cb_flowcontrol.SelectedIndex -eq '2'){
+            Write-Host "Enabling Rx for FlowControl" -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "*FlowControl" -Value "2" -Force}
+            
+            elseif ($cb_flowcontrol.SelectedIndex -eq '3'){
+            Write-Host "Enabling Tx and Rx for FlowControl" -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "*FlowControl" -Value "3" -Force}
+            
+        #IPChecksumOffloadIPv4        
+        if ($cb_IPChecksumOffloadIPv4.SelectedIndex -eq (Get-ItemPropertyValue -Path "$KeyPath" -Name "*IPChecksumOffloadIPv4")){
+            Write-Host "IPChecksumOffloadIPv4 is same then Registry, skipping."  -ForegroundColor green}
+
+            elseif ($cb_IPChecksumOffloadIPv4.SelectedIndex -eq '0'){
+            Write-Host "Disabling IPChecksumOffloadIPv4"  -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "*IPChecksumOffloadIPv4" -Value "0" -Force}
+            
+            elseif ($cb_IPChecksumOffloadIPv4.SelectedIndex -eq '1'){
+            Write-Host "Enabling Tx for IPChecksumOffloadIPv4" -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "*IPChecksumOffloadIPv4" -Value "1" -Force}
+            
+            elseif ($cb_IPChecksumOffloadIPv4.SelectedIndex -eq '2'){
+            Write-Host "Enabling Rx for IPChecksumOffloadIPv4" -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "*IPChecksumOffloadIPv4" -Value "2" -Force}
+            
+            elseif ($cb_IPChecksumOffloadIPv4.SelectedIndex -eq '3'){
+            Write-Host "Enabling Tx and Rx for IPChecksumOffloadIPv4" -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "*IPChecksumOffloadIPv4" -Value "3" -Force}
+           
+        #TCPChecksumOffloadIPv4 
+        if ($cb_TCPChecksumOffloadIPv4.SelectedIndex -eq (Get-ItemPropertyValue -Path "$KeyPath" -Name "*TCPChecksumOffloadIPv4")){
+            Write-Host "TCPChecksumOffloadIPv4 is same then Registry, skipping."  -ForegroundColor green}
+
+            elseif ($cb_TCPChecksumOffloadIPv4.SelectedIndex -eq '0'){
+            Write-Host "Disabling TCPChecksumOffloadIPv4"  -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "*TCPChecksumOffloadIPv4" -Value "0" -Force}
+            
+            elseif ($cb_TCPChecksumOffloadIPv4.SelectedIndex -eq '1'){
+            Write-Host "Enabling Tx for TCPChecksumOffloadIPv4" -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "*TCPChecksumOffloadIPv4" -Value "1" -Force}
+            
+            elseif ($cb_TCPChecksumOffloadIPv4.SelectedIndex -eq '2'){
+            Write-Host "Enabling Rx for TCPChecksumOffloadIPv4" -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "*TCPChecksumOffloadIPv4" -Value "2" -Force}
+            
+            elseif ($cb_TCPChecksumOffloadIPv4.SelectedIndex -eq '3'){
+            Write-Host "Enabling Tx and Rx for TCPChecksumOffloadIPv4" -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "*TCPChecksumOffloadIPv4" -Value "3" -Force}
+            
+        #TCPChecksumOffloadIPv6 
+        if ($cb_TCPChecksumOffloadIPv6.SelectedIndex -eq (Get-ItemPropertyValue -Path "$KeyPath" -Name "*TCPChecksumOffloadIPv6")){
+            Write-Host "TCPChecksumOffloadIPv6 is same then Registry, skipping."  -ForegroundColor green}
+
+            elseif ($cb_TCPChecksumOffloadIPv6.SelectedIndex -eq '0'){
+            Write-Host "Disabling TCPChecksumOffloadIPv6"  -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "*TCPChecksumOffloadIPv6" -Value "0" -Force}
+            
+            elseif ($cb_TCPChecksumOffloadIPv6.SelectedIndex -eq '1'){
+            Write-Host "Enabling Tx for TCPChecksumOffloadIPv6" -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "*TCPChecksumOffloadIPv6" -Value "1" -Force}
+            
+            elseif ($cb_TCPChecksumOffloadIPv6.SelectedIndex -eq '2'){
+            Write-Host "Enabling Rx for TCPChecksumOffloadIPv6" -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "*TCPChecksumOffloadIPv6" -Value "2" -Force}
+            
+            elseif ($cb_TCPChecksumOffloadIPv6.SelectedIndex -eq '3'){
+            Write-Host "Enabling Tx and Rx for TCPChecksumOffloadIPv6" -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "*TCPChecksumOffloadIPv6" -Value "3" -Force}    
+        
+        #UDPChecksumOffloadIPv4 
+        if ($cb_UDPChecksumOffloadIPv4.SelectedIndex -eq (Get-ItemPropertyValue -Path "$KeyPath" -Name "*UDPChecksumOffloadIPv4")){
+            Write-Host "UDPChecksumOffloadIPv4 is same then Registry, skipping."  -ForegroundColor Green}
+
+            elseif ($cb_UDPChecksumOffloadIPv4.SelectedIndex -eq '0'){
+            Write-Host "Disabling UDPChecksumOffloadIPv4"  -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "*UDPChecksumOffloadIPv4" -Value "0" -Force}
+            
+            elseif ($cb_UDPChecksumOffloadIPv4.SelectedIndex -eq '1'){
+            Write-Host "Enabling Tx for UDPChecksumOffloadIPv4" -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "*UDPChecksumOffloadIPv4" -Value "1" -Force}
+            
+            elseif ($cb_UDPChecksumOffloadIPv4.SelectedIndex -eq '2'){
+            Write-Host "Enabling Rx for UDPChecksumOffloadIPv4" -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "*UDPChecksumOffloadIPv4" -Value "2" -Force}
+            
+            elseif ($cb_UDPChecksumOffloadIPv4.SelectedIndex -eq '3'){
+            Write-Host "Enabling Tx and Rx for UDPChecksumOffloadIPv4" -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "*UDPChecksumOffloadIPv4" -Value "3" -Force}
+        
+        #UDPChecksumOffloadIPv6 
+        if ($cb_UDPChecksumOffloadIPv6.SelectedIndex -eq (Get-ItemPropertyValue -Path "$KeyPath" -Name "*UDPChecksumOffloadIPv6")){
+            Write-Host "UDPChecksumOffloadIPv6 is same then Registry, skipping."  -ForegroundColor Green}
+
+            elseif ($cb_UDPChecksumOffloadIPv6.SelectedIndex -eq '0'){
+            Write-Host "Disabling UDPChecksumOffloadIPv6"  -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "*UDPChecksumOffloadIPv6" -Value "0" -Force}
+            
+            elseif ($cb_UDPChecksumOffloadIPv6.SelectedIndex -eq '1'){
+            Write-Host "Enabling Tx for UDPChecksumOffloadIPv6" -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "*UDPChecksumOffloadIPv6" -Value "1" -Force}
+            
+            elseif ($cb_UDPChecksumOffloadIPv6.SelectedIndex -eq '2'){
+            Write-Host "Enabling Rx for UDPChecksumOffloadIPv6" -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "*UDPChecksumOffloadIPv6" -Value "2" -Force}
+            
+            elseif ($cb_UDPChecksumOffloadIPv6.SelectedIndex -eq '3'){
+            Write-Host "Enabling Tx & Rx for UDPChecksumOffloadIPv6" -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "*UDPChecksumOffloadIPv6" -Value "3" -Force} 
+            
+        #Large-Send-Offload V2 (IPv4)
+        if ($cb_LsoV2IPv4.SelectedIndex -eq (Get-ItemPropertyValue -Path "$KeyPath" -Name "*LsoV2IPv4")){
+            Write-Host "LsoV2IPv4 is same then Registry, skipping."  -ForegroundColor green}    
+            
+            elseif ($cb_LsoV2IPv4.SelectedIndex -eq '0'){
+            Write-Host "Disabling LsoV2IPv4"  -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "*LsoV2IPv4" -Value "0" -Force}
+            
+            elseif ($cb_LsoV2IPv4.SelectedIndex -eq '1'){
+            Write-Host "Enabling LsoV2IPv4" -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "*LsoV2IPv4" -Value "1" -Force}
+            
+        #Large-Send-Offload V2 (IPv6)
+        if ($cb_LsoV2IPv6.SelectedIndex -eq (Get-ItemPropertyValue -Path "$KeyPath" -Name "*LsoV2IPv6")){
+            Write-Host "LsoV2IPv6 is same then Registry, skipping."  -ForegroundColor green}    
+            
+            elseif ($cb_LsoV2IPv6.SelectedIndex -eq '0'){
+            Write-Host "Disabling LsoV2IPv4"  -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "*LsoV2IPv6" -Value "0" -Force}
+            
+            elseif ($cb_LsoV2IPv6.SelectedIndex -eq '1'){
+            Write-Host "Enabling LsoV2IPv6" -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "*LsoV2IPv6" -Value "1" -Force}
+            
+        #Large-Send-Offload V1 (IPv4)
+        if ($cb_LsoV1IPv4.SelectedIndex -eq (Get-ItemPropertyValue -Path "$KeyPath" -Name "*LsoV1IPv4")){
+            Write-Host "LsoV1IPv4 is same then Registry, skipping."  -ForegroundColor green}    
+            
+            elseif ($cb_LsoV1IPv4.SelectedIndex -eq '0'){
+            Write-Host "Disabling LsoV1IPv4"  -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "*LsoV1IPv4" -Value "0" -Force}
+            
+            elseif ($cb_LsoV1IPv4.SelectedIndex -eq '1'){
+            Write-Host "Enabling LsoV1IPv4" -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "*LsoV1IPv4" -Value "1" -Force}               
+            
+        #PMARPOffload
+        if ($cb_PMARPOffload.SelectedIndex -eq (Get-ItemPropertyValue -Path "$KeyPath" -Name "*PMARPOffload")){
+            Write-Host "PMARPOffload is same then Registry, skipping."  -ForegroundColor green}    
+            
+            elseif ($cb_PMARPOffload.SelectedIndex -eq '0'){
+            Write-Host "Disabling PMARPOffload"  -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "*PMARPOffload" -Value "0" -Force}
+            
+            elseif ($cb_PMARPOffload.SelectedIndex -eq '1'){
+            Write-Host "Enabling PMARPOffload" -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "*PMARPOffload" -Value "1" -Force}
+            
+        #PMNSOffload
+        if ($cb_PMNSOffload.SelectedIndex -eq (Get-ItemPropertyValue -Path "$KeyPath" -Name "*PMNSOffload")){
+            Write-Host "PMNSOffload is same then Registry, skipping."  -ForegroundColor green}    
+            
+            elseif ($cb_PMNSOffload.SelectedIndex -eq '0'){
+            Write-Host "Disabling PMNSOffload"  -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "*PMNSOffload" -Value "0" -Force}
+            
+            elseif ($cb_PMNSOffload.SelectedIndex -eq '1'){
+            Write-Host "Enabling PMNSOffload" -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "*PMNSOffload" -Value "1" -Force}
+            
+        #PriorityVLANTag   
+        if ($cb_PriorityVLANTag.SelectedIndex -eq (Get-ItemPropertyValue -Path "$KeyPath" -Name "*PriorityVLANTag")){
+            Write-Host "PriorityVLANTag is same then Registry, skipping."  -ForegroundColor Green}    
+            
+            elseif ($cb_PriorityVLANTag.SelectedIndex -eq '0'){
+            Write-Host "Disabling PriorityVLANTag"  -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "*PriorityVLANTag" -Value "0" -Force}
+            
+            elseif ($cb_PriorityVLANTag.SelectedIndex -eq '1'){
+            Write-Host "Enabling Paketpriorität" -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "*PriorityVLANTag" -Value "1" -Force}
+            
+            elseif ($cb_PriorityVLANTag.SelectedIndex -eq '2'){
+            Write-Host "Enabling VLAN" -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "*PriorityVLANTag" -Value "2" -Force}
+            
+            elseif ($cb_PriorityVLANTag.SelectedIndex -eq '3'){
+            Write-Host "Enabling Paketpriorität and VLAN" -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "*PriorityVLANTag" -Value "3" -Force}
+            
+        #ReceiveBuffers   
+        if ($cb_ReceiveBuffers.Text -eq (Get-ItemPropertyValue -Path "$KeyPath" -Name "*ReceiveBuffers"))
+            {
+            Write-Host "ReceiveBuffers is same then Registry, skipping."  -ForegroundColor Green
+            }    
+            else
+            { 
+            Write-Host "Set ReceiveBuffers to $($cb_ReceiveBuffers.Text)"  -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "*ReceiveBuffers" -Value "$($cb_ReceiveBuffers.Text)" -Force
+            }
+            
+        #TransmitBuffers   
+        if ($cb_TransmitBuffers.Text -eq (Get-ItemPropertyValue -Path "$KeyPath" -Name "*TransmitBuffers"))
+            {
+            Write-Host "TransmitBuffers is same then Registry, skipping."  -ForegroundColor Green
+            }    
+            else
+            { 
+            Write-Host "Set TransmitBuffers to $($cb_TransmitBuffers.Text)"  -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "*TransmitBuffers" -Value "$($cb_TransmitBuffers.Text)" -Force
+            }   
+            
+        #InterruptModeration
+        if ($cb_InterruptModeration.SelectedIndex -eq (Get-ItemPropertyValue -Path "$KeyPath" -Name "*InterruptModeration")){
+            Write-Host "InterruptModeration is same then Registry, skipping."  -ForegroundColor Green}
+
+            elseif ($cb_InterruptModeration.SelectedIndex -eq '0'){
+            Write-Host "Disabling InterruptModeration"  -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "*InterruptModeration" -Value "0" -Force}
+            
+            elseif ($cb_InterruptModeration.SelectedIndex -eq '1'){
+            Write-Host "Enabling InterruptModeration" -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "*InterruptModeration" -Value "1" -Force}    
+        
+        #InterruptModerationRate
+        #$RegITR = (Get-ItemPropertyValue -Path "$KeyPath" -Name "ITR")
+        #if ($cb_InterruptModerationRate.Text -eq $RegITR -xor $cb_InterruptModerationRate.SelectedIndex >0){
+            #Write-Host "InterruptModerationRate is same then Registry, skipping."  -ForegroundColor green}
+            
+            if ($cb_InterruptModerationRate.Text -match 'Disabled'){
+            #Write-Host "Disabling InterruptModeration"  -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "ITR" -Value "0" -Force}
+            
+            elseif ($cb_InterruptModerationRate.Text -match 'Minimal'){
+            #Write-Host "Setting InterruptModerationRate to 200 - Minimal" -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "ITR" -Value "200" -Force}        
+            
+            elseif ($cb_InterruptModerationRate.Text -match 'Low'){
+            #Write-Host "Setting InterruptModerationRate to 400 - Low" -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "ITR" -Value "400" -Force}   
+            
+            elseif ($cb_InterruptModerationRate.Text -match 'Medium'){
+            #Write-Host "Setting InterruptModerationRate to 950 - Medium" -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "ITR" -Value "950" -Force}  
+            
+            elseif ($cb_InterruptModerationRate.Text -match 'High'){
+            #Write-Host "Setting InterruptModerationRate to 2000 - High" -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "ITR" -Value "2000" -Force}  
+            
+            elseif ($cb_InterruptModerationRate.Text -match 'Extreme'){
+            #Write-Host "Setting InterruptModerationRate to 3600 - Extreme" -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "ITR" -Value "3600" -Force}  
+            
+            elseif ($cb_InterruptModerationRate.Text -match 'Adaptive'){
+            #Write-Host "Setting InterruptModerationRate to 65535 - Adaptive" -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "ITR" -Value "65535" -Force}  
+            #For applications where low latency is critical, this setting should be approximately 8000 interrupts per second.
+            
+            
+            
+            
+            #TxIntDelay
+            #I-219V 28TxDelay Default
+            if ($tb_TxIntDelay.Text -eq (Get-ItemPropertyValue -Path "$KeyPath" -Name "TxIntDelay"))
+            {
+            Write-Host "TxIntDelay is same then Registry, skipping."  -ForegroundColor Green
+            }    
+            else
+            { 
+            Write-Host "Set TxIntDelay to"$tb_TxIntDelay.Text  -ForegroundColor Green
+            Set-ItemProperty -Path "$KeyPath" -Name "TxIntDelay" -Value $tb_TxIntDelay.Text -Force
+            }
+            #PacketDirect
+            #Unsure Default Enabled or Disabled
+            #Ref:https://docs.microsoft.com/en-us/windows-hardware/drivers/network/introduction-to-ndis-pdpi
+            if ($cb_PacketDirect.Text -match 'Undefined'){
+                #Write-Host "PacketDirect to"$cb_PacketDirect.Text  -ForegroundColor Green
+                Remove-ItemProperty -Path "$KeyPath" -Name "*PacketDirect" -Force}  
+            if ($cb_PacketDirect.Text -match 'Enabled'){
+                Write-Host "PacketDirect to"$cb_PacketDirect.Text  -ForegroundColor Green
+                New-ItemProperty -Path "$KeyPath" -Name "*PacketDirect" -Value "1" -PropertyType "String" -Force}  
+            if ($cb_PacketDirect.Text -match 'Disabled'){
+                Write-Host "PacketDirect to"$cb_PacketDirect.Text  -ForegroundColor Green
+                New-ItemProperty -Path "$KeyPath" -Name "*PacketDirect" -Value "0" -PropertyType "String" -Force}
+                
+            #EnableCoalesce
+            if ($cb_EnableCoalesce.Text -match 'Undefined'){
+                #Write-Host "EnableCoalesce to"$cb_EnableCoalesce.Text  -ForegroundColor Green
+                Remove-ItemProperty -Path "$KeyPath" -Name "EnableCoalesce" -Force}  
+            if ($cb_EnableCoalesce.Text -match 'Enabled'){
+                Write-Host "EnableCoalesce to"$cb_EnableCoalesce.Text  -ForegroundColor Green
+                New-ItemProperty -Path "$KeyPath" -Name "EnableCoalesce" -Value "1" -PropertyType "DWORD" -Force}  
+            if ($cb_EnableCoalesce.Text -match 'Disabled'){
+                Write-Host "EnableCoalesce to"$cb_EnableCoalesce.Text  -ForegroundColor Green
+                New-ItemProperty -Path "$KeyPath" -Name "EnableCoalesce" -Value "0" -PropertyType "DWORD" -Force}
+            
+		    #CoalesceBufferSize
+		    $A=((Get-ItemProperty -Path "$KeyPath").PSObject.Properties.Name -contains "CoalesceBufferSize")
+		    if ($A -eq $false -and $cb_CoalesceBufferSize.Text -ne $null -and $cb_CoalesceBufferSize.Text -ne '2048' ){
+			    Write-Host "Set CoalesceBufferSize to"$cb_CoalesceBufferSize.Text -ForegroundColor Green
+	            New-ItemProperty -Path "$KeyPath" -Name "CoalesceBufferSize" -Typ "Dword" -Value $cb_CoalesceBufferSize.Text -Force
+		    }elseif($A -eq $true -and $cb_CoalesceBufferSize.Text -eq $null -or $cb_CoalesceBufferSize.Text -eq ''){
+			    Write-Warning "Removing CoalesceBufferSize"
+			    Remove-ItemProperty -Path "$KeyPath" -Name "CoalesceBufferSize"
+		    }else{
+			    Write-Host "Set CoalesceBufferSize to"$cb_CoalesceBufferSize.Text -ForegroundColor Green
+	            Set-ItemProperty -Path "$KeyPath" -Name "CoalesceBufferSize" -Value $cb_CoalesceBufferSize.Text -Force	
+		    }
+            
+            #EnableUdpTxScaling
+            if ($cb_EnableUdpTxScaling.Text -match 'Undefined'){
+                #Write-Host "EnableUdpTxScaling to"$cb_EnableUdpTxScaling.Text  -ForegroundColor Green
+                Remove-ItemProperty -Path "$KeyPath" -Name "EnableUdpTxScaling" -Force}  
+            if ($cb_EnableUdpTxScaling.Text -match 'Enabled'){
+                Write-Host "EnableUdpTxScaling to"$cb_EnableUdpTxScaling.Text  -ForegroundColor Green
+                New-ItemProperty -Path "$KeyPath" -Name "EnableUdpTxScaling" -Value "1" -PropertyType "DWORD" -Force}  
+            if ($cb_EnableUdpTxScaling.Text -match 'Disabled'){
+                Write-Host "EnableUdpTxScaling to"$cb_EnableUdpTxScaling.Text  -ForegroundColor Green
+                New-ItemProperty -Path "$KeyPath" -Name "EnableUdpTxScaling" -Value "0" -PropertyType "DWORD" -Force}
+                
+}
+
+        function Set-SelectiveSuspendGlobal {
+            param([string]$Mode)
+            $path = "HKLM:\SYSTEM\CurrentControlSet\Services\NDIS\Parameters"
+            if ($Mode -eq 'Skip') { return }
+            $value = if ($Mode -eq 'Disabled') { 0 } else { 1 }
+            try {
+                New-Item -Path $path -Force | Out-Null
+                New-ItemProperty -Path $path -Name 'DefaultSelectiveSuspend' -PropertyType DWord -Value $value -Force | Out-Null
+                Write-Host "Selective Suspend set to $Mode" -ForegroundColor Green
+            } catch {
+                Write-Warning "Impossibile impostare Selective Suspend: $($_.Exception.Message)"
+            }
+        }
+
+        function Set-PcieAspmPolicy {
+            param([string]$Mode)
+            if ($Mode -eq 'Skip') { return }
+            $value = switch ($Mode) {
+                'Off'      { 0 }
+                'Moderate' { 1 }
+                'Maximum'  { 2 }
+                default    { return }
+            }
+            foreach ($scheme in 'SCHEME_CURRENT') {
+                try {
+                    powercfg -setacvalueindex $scheme SUB_PCIEXPRESS ASPM $value | Out-Null
+                    powercfg -setdcvalueindex $scheme SUB_PCIEXPRESS ASPM $value | Out-Null
+                    powercfg -SetActive $scheme | Out-Null
+                    Write-Host "PCIe ASPM ($Mode) applicato con powercfg" -ForegroundColor Green
+                } catch {
+                    Write-Warning "Errore impostando ASPM: $($_.Exception.Message)"
+                }
+            }
+        }
+
+        function Set-NicPowerSavingState {
+            param([string]$Mode)
+            if ($Mode -eq 'Skip' -or -not $Global:NetConnectionID) { return }
+            $allow = ($Mode -eq 'Enabled')
+            try {
+                Set-NetAdapterPowerManagement -Name $Global:NetConnectionID -AllowComputerToTurnOffDevice $allow -ErrorAction Stop | Out-Null
+                $state = if ($allow) { 'abilitato' } else { 'disabilitato' }
+                Write-Host "Power saving sul dispositivo $state" -ForegroundColor Green
+            } catch {
+                Write-Warning "Impossibile aggiornare PowerSaving per $($Global:NetConnectionID): $($_.Exception.Message)"
+            }
+        }
+
+        function Set-NicWakeState {
+            param([string]$Mode)
+            if ($Mode -eq 'Skip' -or -not $Global:NetConnectionID) { return }
+            try {
+                if ($Mode -eq 'Enabled') {
+                    powercfg -deviceenablewake $Global:NetConnectionID | Out-Null
+                    Write-Host "Wake abilitato per $($Global:NetConnectionID)" -ForegroundColor Green
+                } elseif ($Mode -eq 'Disabled') {
+                    powercfg -devicedisablewake $Global:NetConnectionID | Out-Null
+                    Write-Host "Wake disabilitato per $($Global:NetConnectionID)" -ForegroundColor Green
+                }
+            } catch {
+                Write-Warning "Impossibile aggiornare wake per $($Global:NetConnectionID): $($_.Exception.Message)"
+            }
+        }
+
+        function applypowersavingsettings {
+            #cls
+            # ========================================================
+            # PowerSettings
+
+            #EnablePME
+            # Enables/disables wake-up from Advanced Power Management (APM) sleep states.
+            if ($cb_EnablePME.SelectedIndex -eq '0'){
+            Write-Host "Disabling (APM) sleep states"  -ForegroundColor Green
+            New-ItemProperty -Path "$KeyPath" -Name "EnablePME" -PropertyType DWORD -Value "0" -Force}
+            if ($cb_EnablePME.SelectedIndex -eq '1'){
+            Write-Host "Enabling (APM) sleep states" -ForegroundColor Green
+            New-ItemProperty -Path "$KeyPath" -Name "EnablePME" -PropertyType DWORD -Value "1" -Force} 
+            if ($cb_EnablePME.SelectedIndex -eq '2'){
+            Write-Host "Skipping (APM) sleep states"  -ForegroundColor Green}
+            
+            #EnableDynamicPowerGating
+            if ($cb_EnableDynamicPowerGating.SelectedIndex -eq '0'){
+            Write-Host "Disabling DynamicPowerGating"  -ForegroundColor Green
+            New-ItemProperty -Path "$KeyPath" -Name "*EnableDynamicPowerGating" -PropertyType String -Value "0" -Force}
+            if ($cb_EnableDynamicPowerGating.SelectedIndex -eq '1'){
+            Write-Host "Enabling DynamicPowerGating" -ForegroundColor Green
+            New-ItemProperty -Path "$KeyPath" -Name "*EnableDynamicPowerGating" -PropertyType String -Value "1" -Force} 
+            if ($cb_EnableDynamicPowerGating.SelectedIndex -eq '2'){
+            Write-Host "Skipping DynamicPowerGating" -ForegroundColor Green}
+
+            #EnableConnectedPowerGating
+            if ($cb_EnableConnectedPowerGating.SelectedIndex -eq '0'){
+            Write-Host "Disabling ConnectedPowerGating"  -ForegroundColor Green
+            New-ItemProperty -Path "$KeyPath" -Name "EnableConnectedPowerGating" -PropertyType DWORD -Value "0" -Force}
+            if ($cb_EnableConnectedPowerGating.SelectedIndex -eq '1'){
+            Write-Host "Enabling ConnectedPowerGating" -ForegroundColor Green
+            New-ItemProperty -Path "$KeyPath" -Name "EnableConnectedPowerGating" -PropertyType DWORD -Value "1" -Force} 
+            if ($cb_EnableConnectedPowerGating.SelectedIndex -eq '2'){
+            Write-Host "Skipping ConnectedPowerGating" -ForegroundColor Green}
+            
+            #AutoPowerSaveModeEnabled
+            if ($cb_AutoPowerSaveModeEnabled.SelectedIndex -eq '0'){
+            Write-Host "Disabling AutoPowerSaveMode"  -ForegroundColor Green
+            New-ItemProperty -Path "$KeyPath" -Name "AutoPowerSaveModeEnabled" -PropertyType DWORD -Value "0" -Force}
+            if ($cb_AutoPowerSaveModeEnabled.SelectedIndex -eq '1'){
+            Write-Host "Enabling AutoPowerSaveMode" -ForegroundColor Green
+            New-ItemProperty -Path "$KeyPath" -Name "AutoPowerSaveModeEnabled" -PropertyType DWORD -Value "1" -Force} 
+            if ($cb_AutoPowerSaveModeEnabled.SelectedIndex -eq '2'){
+            Write-Host "Skipping AutoPowerSaveMode" -ForegroundColor Green}
+           
+            #NicAutoPowerSaver
+            if ($cb_NicAutoPowerSaver.SelectedIndex -eq '0'){
+            Write-Host "Disabling NicAutoPowerSaver"  -ForegroundColor Green
+            New-ItemProperty -Path "$KeyPath" -Name "*NicAutoPowerSaver" -PropertyType String -Value "0" -Force}
+            if ($cb_NicAutoPowerSaver.SelectedIndex -eq '1'){
+            Write-Host "Enabling NicAutoPowerSaver" -ForegroundColor Green
+            New-ItemProperty -Path "$KeyPath" -Name "*NicAutoPowerSaver" -PropertyType String -Value "1" -Force} 
+            if ($cb_NicAutoPowerSaver.SelectedIndex -eq '2'){
+            Write-Host "Skipping NicAutoPowerSaver" -ForegroundColor Green}
+            
+            #DisableDelayedPowerUp
+            if ($cb_DisableDelayedPowerUp.SelectedIndex -eq '0'){
+            Write-Host "Enabling DelayedPowerUp" -ForegroundColor Green
+            New-ItemProperty -Path "$KeyPath" -Name "DisableDelayedPowerUp" -PropertyType DWORD -Value "0" -Force} 
+            if ($cb_DisableDelayedPowerUp.SelectedIndex -eq '1'){
+            Write-Host "Disabling DelayedPowerUp"  -ForegroundColor Green
+            New-ItemProperty -Path "$KeyPath" -Name "DisableDelayedPowerUp" -PropertyType DWORD -Value "1" -Force}
+            if ($cb_DisableDelayedPowerUp.SelectedIndex -eq '2'){
+            Write-Host "Skipping DelayedPowerUp" -ForegroundColor Green}
+            
+            #ReduceSpeedOnPowerDown
+            if ($cb_ReduceSpeedOnPowerDown.SelectedIndex -eq '0'){
+            Write-Host "Disabling ReduceSpeedOnPowerDown" -ForegroundColor Green
+            New-ItemProperty -Path "$KeyPath" -Name "ReduceSpeedOnPowerDown" -PropertyType DWORD -Value "0" -Force} 
+            if ($cb_ReduceSpeedOnPowerDown.SelectedIndex -eq '1'){
+            Write-Host "Enabling ReduceSpeedOnPowerDown"  -ForegroundColor Green
+            New-ItemProperty -Path "$KeyPath" -Name "ReduceSpeedOnPowerDown" -PropertyType DWORD -Value "1" -Force}
+            if ($cb_ReduceSpeedOnPowerDown.SelectedIndex -eq '2'){
+            Write-Host "Skipping ReduceSpeedOnPowerDown" -ForegroundColor Green}
+
+            Set-SelectiveSuspendGlobal -Mode $cb_DefaultSelectiveSuspend.Text
+            Set-PcieAspmPolicy -Mode $cb_PcieAspm.Text
+            Set-NicPowerSavingState -Mode $cb_DevicePowerSaving.Text
+            Set-NicWakeState -Mode $cb_AllowWake.Text
+
+
+        }
+
+        function Load-TcpOsOffloadsSettings {
+            Write-Host "Loading TCP/OS Offloads for NIC: $($Global:NIC_ALIAS)" -ForegroundColor Cyan
+            # Path del registro TCP/IP
+            $TcpipParams = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters"
+            $TcpipInterfaces = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces"
+            
+            # === TCP Window Auto-Tuning ===
+            try {
+                $autotuning = (netsh int tcp show global | Select-String -Pattern 'Receive Window Auto-Tuning Level').ToString()
+                if ($autotuning -match 'disabled') { $cb_TcpWindowAutoTuning.Text = 'disabled' }
+                elseif ($autotuning -match 'normal') { $cb_TcpWindowAutoTuning.Text = 'normal' }
+                elseif ($autotuning -match 'restricted') { $cb_TcpWindowAutoTuning.Text = 'restricted' }
+                elseif ($autotuning -match 'highly') { $cb_TcpWindowAutoTuning.Text = 'highlyrestricted' }
+                elseif ($autotuning -match 'experimental') { $cb_TcpWindowAutoTuning.Text = 'experimental' }
+            } catch { 
+                $cb_TcpWindowAutoTuning.Text = 'normal' 
+            }
+            
+            # === Windows Scaling Heuristics ===
+            try {
+                $heuristics = (netsh int tcp show heuristics | Select-String -Pattern 'Window Scaling heuristics').ToString()
+                if ($heuristics -match 'disabled') { $cb_WindowsScalingHeuristics.Text = 'disabled' }
+                else { $cb_WindowsScalingHeuristics.Text = 'enabled' }
+            } catch { 
+                $cb_WindowsScalingHeuristics.Text = 'enabled' 
+            }
+            
+            # === Congestion Provider ===
+            try {
+                $congestion = (netsh int tcp show supplemental | Select-String -Pattern 'Congestion Provider').ToString()
+                if ($congestion -match 'ctcp') { $cb_CongestionControlProvider.Text = 'ctcp' }
+                elseif ($congestion -match 'cubic') { $cb_CongestionControlProvider.Text = 'cubic' }
+                elseif ($congestion -match 'bbr2') { $cb_CongestionControlProvider.Text = 'bbr2' }
+                elseif ($congestion -match 'newreno') { $cb_CongestionControlProvider.Text = 'newreno' }
+                else { $cb_CongestionControlProvider.Text = 'ctcp' }
+            } catch { 
+                $cb_CongestionControlProvider.Text = 'ctcp' 
+            }
+            
+            # === RSS (già gestito da Global Settings) ===
+            try {
+                $rssValue = Get-NetOffloadGlobalSetting | Select-Object -ExpandProperty ReceiveSideScaling
+                if ($rssValue) {
+                    $cb_ReceiveSideScaling.Text = $rssValue.ToString().ToLower()
+                } else {
+                    $cb_ReceiveSideScaling.Text = 'enabled'
+                }
+            } catch {
+                $cb_ReceiveSideScaling.Text = 'enabled'
+            }
+            
+            # === RSC (già gestito da Global Settings) ===
+            try {
+                $rscValue = Get-NetOffloadGlobalSetting | Select-Object -ExpandProperty ReceiveSegmentCoalescing
+                if ($rscValue) {
+                    $cb_Rsc.Text = $rscValue.ToString().ToLower()
+                } else {
+                    $cb_Rsc.Text = 'enabled'
+                }
+            } catch {
+                $cb_Rsc.Text = 'enabled'
+            }
+            
+            # === TTL (DefaultTTL) ===
+            try {
+                $ttl = Get-ItemPropertyValue -Path $TcpipParams -Name "DefaultTTL" -ErrorAction Stop
+                $tb_Ttl.Text = $ttl.ToString()
+            } catch { 
+                $tb_Ttl.Text = "64" 
+            }
+            
+            # === ECN Capability ===
+            try {
+                $ecn = (netsh int tcp show global | Select-String -Pattern 'ECN Capability').ToString()
+                if ($ecn -match 'disabled') { $cb_EcnCapability.Text = 'disabled' }
+                elseif ($ecn -match 'enabled') { $cb_EcnCapability.Text = 'enabled' }
+                else { $cb_EcnCapability.Text = 'default' }
+            } catch { 
+                $cb_EcnCapability.Text = 'default' 
+            }
+            
+            # === Checksum Offloading (Task Offload) ===
+            try {
+                $checksumValue = Get-NetOffloadGlobalSetting | Select-Object -ExpandProperty TaskOffload
+                if ($checksumValue) {
+                    $cb_ChecksumOffloading.Text = $checksumValue.ToString().ToLower()
+                } else {
+                    $cb_ChecksumOffloading.Text = 'enabled'
+                }
+            } catch {
+                $cb_ChecksumOffloading.Text = 'enabled'
+            }
+            
+            # === TCP Chimney ===
+            try {
+                $chimneyValue = Get-NetOffloadGlobalSetting | Select-Object -ExpandProperty Chimney
+                if ($chimneyValue) {
+                    $cb_TcpChimney.Text = $chimneyValue.ToString().ToLower()
+                } else {
+                    $cb_TcpChimney.Text = 'disabled'
+                }
+            } catch {
+                $cb_TcpChimney.Text = 'disabled'
+            }
+            
+            # === LSO ===
+            try {
+                $taskOffload = Get-NetOffloadGlobalSetting | Select-Object -ExpandProperty TaskOffload
+                if ($taskOffload -and $taskOffload.ToString() -eq 'Enabled') {
+                    $cb_Lso.Text = 'enabled'
+                } else {
+                    $cb_Lso.Text = 'disabled'
+                }
+            } catch {
+                $cb_Lso.Text = 'enabled'
+            }
+            
+            # === TCP 1323 Timestamps ===
+            try {
+                $timestamps = (netsh int tcp show global | Select-String -Pattern 'Timestamps').ToString()
+                if ($timestamps -match 'disabled') { $cb_Tcp1323Timestamps.Text = 'disabled' }
+                else { $cb_Tcp1323Timestamps.Text = 'enabled' }
+            } catch { 
+                $cb_Tcp1323Timestamps.Text = 'disabled' 
+            }
+            
+            # === Internet Explorer Optimization ===
+            try {
+                $maxConn10 = Get-ItemPropertyValue -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings" -Name "MaxConnectionsPer1_0Server" -ErrorAction Stop
+                $tb_MaxConnectionsPer10.Text = $maxConn10.ToString()
+            } catch { 
+                $tb_MaxConnectionsPer10.Text = "10" 
+            }
+            
+            try {
+                $maxConn = Get-ItemPropertyValue -Path "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings" -Name "MaxConnectionsPerServer" -ErrorAction Stop
+                $tb_MaxConnectionsPerServer.Text = $maxConn.ToString()
+            } catch { 
+                $tb_MaxConnectionsPerServer.Text = "10" 
+            }
+            
+            # === Host Resolution Priority ===
+            $DnsPolicyPath = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\ServiceProvider"
+            try {
+                $localPrio = Get-ItemPropertyValue -Path $DnsPolicyPath -Name "LocalPriority" -ErrorAction Stop
+                $tb_LocalPriority.Text = $localPrio.ToString()
+            } catch { 
+                $tb_LocalPriority.Text = "499" 
+            }
+            
+            try {
+                $hostPrio = Get-ItemPropertyValue -Path $DnsPolicyPath -Name "HostsPriority" -ErrorAction Stop
+                $tb_HostPriority.Text = $hostPrio.ToString()
+            } catch { 
+                $tb_HostPriority.Text = "500" 
+            }
+            
+            try {
+                $dnsPrio = Get-ItemPropertyValue -Path $DnsPolicyPath -Name "DnsPriority" -ErrorAction Stop
+                $tb_DnsPriority.Text = $dnsPrio.ToString()
+            } catch { 
+                $tb_DnsPriority.Text = "2000" 
+            }
+            
+            try {
+                $netbtPrio = Get-ItemPropertyValue -Path $DnsPolicyPath -Name "NetbtPriority" -ErrorAction Stop
+                $tb_NetbtPriority.Text = $netbtPrio.ToString()
+            } catch { 
+                $tb_NetbtPriority.Text = "2001" 
+            }
+            
+            # === Max SYN Retransmissions ===
+            try {
+                $synRetrans = Get-ItemPropertyValue -Path $TcpipParams -Name "TcpMaxDataRetransmissions" -ErrorAction Stop
+                $tb_MaxSynRetransmissions.Text = $synRetrans.ToString()
+            } catch { 
+                $tb_MaxSynRetransmissions.Text = "5" 
+            }
+            
+            # === NonSackRttResiliency ===
+            try {
+                $nonsack = Get-ItemPropertyValue -Path $TcpipParams -Name "TcpMaxDataRetransmissions" -ErrorAction Stop
+                if ($nonsack -le 3) { $cb_NonSackRttResiliency.Text = 'disabled' }
+                else { $cb_NonSackRttResiliency.Text = 'enabled' }
+            } catch { 
+                $cb_NonSackRttResiliency.Text = 'disabled' 
+            }
+            
+            # === Initial RTO ===
+            try {
+                $initialRto = (netsh int tcp show global | Select-String -Pattern 'Initial RTO').ToString()
+                if ($initialRto -match '(\d+)') { 
+                    $tb_InitialRto.Text = $Matches[1] 
+                } else { 
+                    $tb_InitialRto.Text = "3000" 
+                }
+            } catch { 
+                $tb_InitialRto.Text = "3000" 
+            }
+            
+            # === Min RTO ===
+            try {
+                $minRto = Get-ItemPropertyValue -Path $TcpipParams -Name "TcpMinimumRto" -ErrorAction Stop
+                $tb_MinRto.Text = $minRto.ToString()
+            } catch { 
+                $tb_MinRto.Text = "300" 
+            }
+            
+            # === QoS NonBestEffortLimit ===
+            try {
+                $qosLimit = Get-ItemPropertyValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Psched" -Name "NonBestEffortLimit" -ErrorAction Stop
+                $tb_QosNonBestEffort.Text = $qosLimit.ToString()
+            } catch { 
+                $tb_QosNonBestEffort.Text = "20" 
+            }
+            
+            # === QoS Do not use NLA ===
+            try {
+                $nla = Get-ItemPropertyValue -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows\Psched" -Name "NonBestEffortLimit" -ErrorAction Stop
+                if ($nla -eq 0) { $cb_QosNla.Text = 'disabled' }
+                else { $cb_QosNla.Text = 'enabled' }
+            } catch { 
+                $cb_QosNla.Text = 'enabled' 
+            }
+            
+            # === Network Throttling Index ===
+            $MmcssPath = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Multimedia\SystemProfile"
+            try {
+                $nti = Get-ItemPropertyValue -Path $MmcssPath -Name "NetworkThrottlingIndex" -ErrorAction Stop
+                $tb_NetworkThrottlingIndex.Text = "0x{0:X}" -f $nti
+            } catch { 
+                $tb_NetworkThrottlingIndex.Text = "0xFFFFFFFF" 
+            }
+            
+            # === ACK Tweaks (per l'adapter corrente) ===
+            Write-Host "  > Loading ACK Tweaks..." -ForegroundColor Gray
+            if ($Global:NIC_ALIAS) {
+                try {
+                    $ackPath = Get-InterfaceRegPath -NicName $Global:NIC_ALIAS
+                    if ($ackPath -and (Test-Path $ackPath)) {
+                        try {
+                            $ackFreq = Get-ItemPropertyValue -Path $ackPath -Name "TcpAckFrequency" -ErrorAction Stop
+                            $tb_TcpAckFrequency.Text = $ackFreq.ToString()
+                        } catch { 
+                            $tb_TcpAckFrequency.Text = "2" 
+                        }
+                        
+                        try {
+                            $noDelay = Get-ItemPropertyValue -Path $ackPath -Name "TCPNoDelay" -ErrorAction Stop
+                            $tb_TcpNoDelay.Text = $noDelay.ToString()
+                        } catch { 
+                            $tb_TcpNoDelay.Text = "0" 
+                        }
+                        try {
+                            $noDelay = Get-ItemPropertyValue -Path $ackPath -Name "TCPDelAckTicks" -ErrorAction Stop
+                            $tb_TcpDelAckTicks.Text = $noDelay.ToString()
+                        } catch { 
+                            $tb_TcpDelAckTicks.Text = "0" 
+                        }
+                    } else {
+                        # Path non trovato, usa defaults
+                        $tb_TcpAckFrequency.Text = "2"
+                        $tb_TcpNoDelay.Text = "0"
+                    }
+                } catch {
+                    Write-Warning "ACK Tweaks load error: $($_.Exception.Message)"
+                    $tb_TcpAckFrequency.Text = "2"
+                    $tb_TcpNoDelay.Text = "0"
+                }
+            } else {
+                $tb_TcpAckFrequency.Text = "2"
+                $tb_TcpNoDelay.Text = "0"
+            }
+            
+            # === Large System Cache ===
+            Write-Host "  > Loading Large System Cache..." -ForegroundColor Gray
+            try {
+                $cachePath = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management"
+                if (Test-Path $cachePath) {
+                    $cache = Get-ItemPropertyValue -Path $cachePath -Name "LargeSystemCache" -ErrorAction Stop
+                    $cb_LargeSystemCache.Text = $cache.ToString()
+                } else {
+                    $cb_LargeSystemCache.Text = "0"
+                }
+            } catch { 
+                $cb_LargeSystemCache.Text = "0" 
+            }
+            
+            # === Dynamic Port Allocation ===
+            Write-Host "  > Loading Dynamic Port Allocation..." -ForegroundColor Gray
+            try {
+                if (Test-Path $TcpipParams) {
+                    try {
+                        $maxPort = Get-ItemPropertyValue -Path $TcpipParams -Name "MaxUserPort" -ErrorAction Stop
+                        $tb_MaxUserPort.Text = $maxPort.ToString()
+                    } catch { 
+                        $tb_MaxUserPort.Text = "65534" 
+                    }
+                    
+                    try {
+                        $timewait = Get-ItemPropertyValue -Path $TcpipParams -Name "TcpTimedWaitDelay" -ErrorAction Stop
+                        $tb_TcpTimedWaitDelay.Text = $timewait.ToString()
+                    } catch { 
+                        $tb_TcpTimedWaitDelay.Text = "30" 
+                    }
+                } else {
+                    $tb_MaxUserPort.Text = "65534"
+                    $tb_TcpTimedWaitDelay.Text = "30"
+                }
+            } catch {
+                Write-Warning "Dynamic Port Allocation load error: $($_.Exception.Message)"
+                $tb_MaxUserPort.Text = "65534"
+                $tb_TcpTimedWaitDelay.Text = "30"
+            }
+            
+            Write-Host "TCP/OS Offloads settings loaded successfully." -ForegroundColor Green
+        }
+
+        #Adding more then Default RSSQueues
+        function RSSQueuesUnlock{
+        $NumRssQueues1 = Test-Path -Path "$KeyPath\Ndi\Params\*NumRssQueues"
+        $NumRssQueues2 = Test-Path -Path "$KeyPath\Ndi\Params\*NumRssQueues\Enum"
+        $AdapterQueuesOriginal = Get-ItemProperty "$KeyPath\Ndi\Params\*NumRssQueues" -Name "default" | select -expand default
+        
+        
+        #If($NumRssQueues1 -eq $False){
+            New-Item -Path "$KeyPath\Ndi\Params\*NumRssQueues" -Force 
+            New-ItemProperty "$KeyPath\Ndi\Params\*NumRssQueues" -Name "ParamDesc" -PropertyTyp "String" -Value "Maximum Number of RSS Queues" -Force
+            New-ItemProperty "$KeyPath\Ndi\Params\*NumRssQueues" -Name "default" -PropertyTyp "String" -Value $AdapterQueuesOriginal -Force
+            New-ItemProperty "$KeyPath\Ndi\Params\*NumRssQueues" -Name "type" -PropertyTyp "String" -Value "enum" -Force
+        #}
+        #If($NumRssQueues2 -eq $False){
+            New-Item -Path "$KeyPath\Ndi\Params\*NumRssQueues\Enum" -Force
+            New-ItemProperty -Path "$KeyPath\Ndi\Params\*NumRssQueues\Enum" -Name "1" -PropertyType STRING -Value "1 Queue" -Force
+            New-ItemProperty -Path "$KeyPath\Ndi\Params\*NumRssQueues\Enum" -Name "2" -PropertyType STRING -Value "2 Queues" -Force
+            New-ItemProperty -Path "$KeyPath\Ndi\Params\*NumRssQueues\Enum" -Name "3" -PropertyType STRING -Value "3 Queues" -Force
+            New-ItemProperty -Path "$KeyPath\Ndi\Params\*NumRssQueues\Enum" -Name "4" -PropertyType STRING -Value "4 Queues" -Force
+            New-ItemProperty -Path "$KeyPath\Ndi\Params\*NumRssQueues\Enum" -Name "5" -PropertyType STRING -Value "5 Queues" -Force
+            New-ItemProperty -Path "$KeyPath\Ndi\Params\*NumRssQueues\Enum" -Name "6" -PropertyType STRING -Value "6 Queues" -Force
+            New-ItemProperty -Path "$KeyPath\Ndi\Params\*NumRssQueues\Enum" -Name "7" -PropertyType STRING -Value "7 Queues" -Force
+            New-ItemProperty -Path "$KeyPath\Ndi\Params\*NumRssQueues\Enum" -Name "8" -PropertyType STRING -Value "8 Queues" -Force
+            New-ItemProperty -Path "$KeyPath\Ndi\Params\*NumRssQueues\Enum" -Name "9" -PropertyType STRING -Value "9 Queues" -Force
+            New-ItemProperty -Path "$KeyPath\Ndi\Params\*NumRssQueues\Enum" -Name "10" -PropertyType STRING -Value "10 Queues" -Force
+            New-ItemProperty -Path "$KeyPath\Ndi\Params\*NumRssQueues\Enum" -Name "11" -PropertyType STRING -Value "11 Queues" -Force
+            New-ItemProperty -Path "$KeyPath\Ndi\Params\*NumRssQueues\Enum" -Name "12" -PropertyType STRING -Value "12 Queues" -Force
+        #}   
+        $cb_rssqueues.Items.Clear()
+        $AdapterQueuesDefault = Get-ItemProperty "$KeyPath\Ndi\Params\*NumRssQueues" -Name "default" | select -expand default
+        #Query Avaible RSSQueues
+        $AdapterQueues = Get-Item -Path "$KeyPath\Ndi\Params\*NumRssQueues\Enum" | Select -ExpandProperty Property
+        @($AdapterQueues) | ForEach-Object {[void] $cb_rssqueues.Items.Add($_)}
+        $cb_rssqueues.Text = $AdapterQueuesDefault
+        #$btn_unqueues.Enabled = $False
+        }
+
+
+$cb_AdapterNamesCombo.Add_SelectedValueChanged({ UpdateNicContext })
+
+function adapter_restart {
+    Try {
+    Restart-NetAdapter -InterfaceDescription $NIC_Desc
+    Write-Host "Restarting Adapter $NIC_Desc now!" -ForegroundColor Red
+    }
+    catch{
+        Write-Host "No Adapter selected." -ForegroundColor Red
+        }
+}
+
+# Open RegPath Adapter per Button
+
+function btn_regopadap {
+        Try {
+        $regPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Applets\Regedit"
+        $name = "LastKey"
+        $value = "Computer\"+(Convert-Path ($Global:KeyPath))
+                New-ItemProperty -Path $regPath -Name $name -Value $value -PropertyType String -Force | Out-Null
+                Start-Process RegEdit
+            } 
+            catch 
+            {
+                Write-Host "No Adapter selected." -ForegroundColor Red
+            }
+}
+
+function Interrupt{
+    $Path = 'HKEY_LOCAL_MACHINE\System\CurrentControlSet\Enum'
+    #$Global:EthernetClassGuid
+    #$Global:EthernetPNPDeviceID
+    $NewPath = "$Path\$EthernetPNPDeviceID"
+    $Test = Test-Path REGISTRY::$NewPath
+    if ($Test){
+	
+	}else{
+	Write-Warning "GPU not found. Abort"
+	}
+}
+
+function bypassrssqueues{
+    $error.clear()
+    try { Set-NetAdapterRss -InterfaceDescription $($Global:NIC_Desc) -BaseProcessorNumber $($cb_rssbaseproc.Text) -MaxProcessorNumber $($cb_rssmaxproc.Text) -Profile $($cb_rssprofile.Text) -MaxProcessors $($cb_rssmaxprocs.Text) -Enabled $($Global:Rssstatusset) -ErrorAction Stop
+         } catch { Write-Warning "Error occured while Setting Set-NetAdapterRss, Abort." }
+    if (!$error) { Write-Host 'No Error Occured, while Setting Set-NetAdapterRss without NumberOfReceiveQueues. Continue.'
+                    Write-Host "Using Registry now, to set RSS Queues to $($cb_rssqueues.Text)"
+                    Set-ItemProperty -Path "$KeyPath\Ndi\Params\*NumRssQueues" -Name "default" -Value $cb_rssqueues.Text -Force -ErrorAction "Stop"
+                    Write-Host "Done."
+        }
+}
+function applyrsssettings {
+        
+        #DisablePortScaling
+        if ($cb_DisablePortScaling.SelectedIndex -eq '0'){
+        Write-Host "Disabling DisablePortScaling" -ForegroundColor Green
+        New-ItemProperty -Path "$KeyPath" -Name "DisablePortScaling" -PropertyType DWORD -Value "0" -Force} 
+        if ($cb_DisablePortScaling.SelectedIndex -eq '1'){
+        Write-Host "Enabling DisablePortScaling"  -ForegroundColor Green
+        New-ItemProperty -Path "$KeyPath" -Name "DisablePortScaling" -PropertyType DWORD -Value "1" -Force}
+        if ($cb_DisablePortScaling.SelectedIndex -eq '2'){
+        Write-Host "Skipping DisablePortScaling"  -ForegroundColor Green}
+        
+        #ManyCoreScaling
+        if ($cb_ManyCoreScaling.SelectedIndex -eq '0'){
+        Write-Host "Disabling ManyCoreScaling" -ForegroundColor Green
+        New-ItemProperty -Path "$KeyPath" -Name "ManyCoreScaling" -PropertyType DWORD -Value "0" -Force} 
+        if ($cb_ManyCoreScaling.SelectedIndex -eq '1'){
+        Write-Host "Enabling ManyCoreScaling"  -ForegroundColor Green
+        New-ItemProperty -Path "$KeyPath" -Name "ManyCoreScaling" -PropertyType DWORD -Value "1" -Force}
+        if ($cb_ManyCoreScaling.SelectedIndex -eq '2'){
+        Write-Host "Skipping ManyCoreScaling"  -ForegroundColor Green}
+        
+        #Write-Host "Testing Setting RSS"
+        $error.clear()
+        try { 
+            #Write-Host "Using Powersh. now to set rss"
+            Set-NetAdapterRss -InterfaceDescription $($Global:NIC_Desc) -BaseProcessorNumber $($cb_rssbaseproc.Text) -MaxProcessorNumber $($cb_rssmaxproc.Text) -NumberOfReceiveQueues $($cb_rssqueues.Text) -Profile $($cb_rssprofile.Text) -MaxProcessors $($cb_rssmaxprocs.Text) -Enabled $($Global:Rssstatusset) -ErrorAction Stop
+            Write-Host "Using Powershell to Set-NetAdapterRss."
+            }
+            catch { Write-Warning "Error occured while Setting Set-NetAdapterRss, testing now without NumberOfReceiveQueues!"
+            bypassrssqueues
+            }
+        #if (!$error) { Write-Host "No Error Occured, while Setting Set-NetAdapterRss with NumberOfReceiveQueues." }
+        
+        #Set-NetAdapterRss -InterfaceDescription $($Global:NIC_Desc) -BaseProcessorNumber $($cb_rssbaseproc.Text) -MaxProcessorNumber $($cb_rssmaxproc.Text) -NumberOfReceiveQueues $($cb_rssqueues.Text) -Profile $($cb_rssprofile.Text) -MaxProcessors $($cb_rssmaxprocs.Text) -Enabled $($Global:Rssstatusset)
+}
+
+function ApplyInterfaceSettings{
+    if ($cb_AdvertiseDefaultRoute.Text -eq (Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand AdvertiseDefaultRoute)){
+        Write-Host "AdvertiseDefaultRoute is same, skipping."  -ForegroundColor green}
+        else{
+            Write-Host "AdvertiseDefaultRoute:"$cb_AdvertiseDefaultRoute.Text  -ForegroundColor Green
+            Set-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily -AdvertiseDefaultRoute $cb_AdvertiseDefaultRoute.Text
+        }
+    if ($cb_Advertising.Text -eq (Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand Advertising)){
+        Write-Host "Advertising is same, skipping."  -ForegroundColor green}
+        else{
+            Write-Host "Advertising:"$cb_Advertising.Text  -ForegroundColor Green
+            Set-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily -Advertising $cb_Advertising.Text
+        }
+    if ($cb_AutomaticMetric.Text -eq (Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand AutomaticMetric)){
+        Write-Host "AutomaticMetric is same, skipping."  -ForegroundColor green}
+        else{
+            Write-Host "AutomaticMetric:"$cb_AutomaticMetric.Text  -ForegroundColor Green
+            Set-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily -AutomaticMetric $cb_AutomaticMetric.Text
+        }
+    if ($cb_ClampMss.Text -eq (Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand ClampMss)){
+        Write-Host "ClampMss is same, skipping."  -ForegroundColor green}
+        else{
+            Write-Host "ClampMss:"$cb_ClampMss.Text  -ForegroundColor Green
+            Set-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily -ClampMss $cb_ClampMss.Text
+        }
+    if ($DirectedMacWolPattern.Text -eq (Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand DirectedMacWolPattern)){
+        Write-Host "DirectedMacWolPattern is same, skipping."  -ForegroundColor green}
+        else{
+            Write-Host "DirectedMacWolPattern:"$DirectedMacWolPattern.Text  -ForegroundColor Green
+            Set-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily -DirectedMacWolPattern $DirectedMacWolPattern.Text
+        }
+    if ($cb_EcnMarking.Text -eq (Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand EcnMarking)){
+        Write-Host "EcnMarking is same, skipping."  -ForegroundColor green}
+        else{
+            Write-Host "EcnMarking:"$cb_EcnMarking.Text  -ForegroundColor Green
+            Set-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily -EcnMarking $cb_EcnMarking.Text
+        }
+    if ($cb_ForceArpNdWolPattern.Text -eq (Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand ForceArpNdWolPattern)){
+        Write-Host "ForceArpNdWolPattern is same, skipping."  -ForegroundColor green}
+        else{
+            Write-Host "ForceArpNdWolPattern:"$cb_ForceArpNdWolPattern.Text  -ForegroundColor Green
+            Set-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily -ForceArpNdWolPattern $cb_ForceArpNdWolPattern.Text
+        }
+    if ($cb_Forwarding.Text -eq (Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand Forwarding)){
+        Write-Host "Forwarding is same, skipping."  -ForegroundColor green}
+        else{
+            Write-Host "Forwarding:"$cb_Forwarding.Text  -ForegroundColor Green
+            Set-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily -Forwarding $cb_Forwarding.Text
+        }
+    if ($cb_IgnoreDefaultRoutes.Text -eq (Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand IgnoreDefaultRoutes)){
+        Write-Host "IgnoreDefaultRoutes is same, skipping."  -ForegroundColor green}
+        else{
+            Write-Host "IgnoreDefaultRoutes:"$cb_IgnoreDefaultRoutes.Text  -ForegroundColor Green
+            Set-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily -IgnoreDefaultRoutes $cb_IgnoreDefaultRoutes.Text
+        }
+    if ($cb_ManagedAddressConfiguration.Text -eq (Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand ManagedAddressConfiguration)){
+        Write-Host "ManagedAddressConfiguration is same, skipping."  -ForegroundColor green}
+        else{
+            Write-Host "ManagedAddressConfiguration:"$cb_ManagedAddressConfiguration.Text  -ForegroundColor Green
+            Set-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily -ManagedAddressConfiguration $cb_ManagedAddressConfiguration.Text
+        }
+    if ($cb_NeighborDiscoverySupported.Text -eq (Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand NeighborDiscoverySupported)){
+        Write-Host "NeighborDiscoverySupported is same, skipping."  -ForegroundColor green}
+        else{
+            Write-Host "NeighborDiscoverySupported:"$cb_NeighborDiscoverySupported.Text  -ForegroundColor Green
+            Set-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily -NeighborDiscoverySupported $cb_NeighborDiscoverySupported.Text
+        }
+    if ($cb_NeighborUnreachabilityDetection.Text -eq (Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand NeighborUnreachabilityDetection)){
+        Write-Host "NeighborUnreachabilityDetection is same, skipping."  -ForegroundColor green}
+        else{
+            Write-Host "NeighborUnreachabilityDetection:"$cb_NeighborUnreachabilityDetection.Text  -ForegroundColor Green
+            Set-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily -NeighborUnreachabilityDetection $cb_NeighborUnreachabilityDetection.Text
+        }
+    if ($cb_OtherStatefulConfiguration.Text -eq (Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand OtherStatefulConfiguration)){
+        Write-Host "OtherStatefulConfiguration is same, skipping."  -ForegroundColor green}
+        else{
+            Write-Host "OtherStatefulConfiguration:"$cb_OtherStatefulConfiguration.Text  -ForegroundColor Green
+            Set-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily -OtherStatefulConfiguration $cb_OtherStatefulConfiguration.Text
+        }
+    if ($cb_RouterDiscovery.Text -eq (Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand RouterDiscovery)){
+        Write-Host "RouterDiscovery is same, skipping."  -ForegroundColor green}
+        else{
+            Write-Host "RouterDiscovery:"$cb_RouterDiscovery.Text  -ForegroundColor Green
+            Set-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily -RouterDiscovery $cb_RouterDiscovery.Text
+        }
+    if ($cb_Store.Text -eq (Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand Store)){
+        Write-Host "Store is same, skipping."  -ForegroundColor green}
+        else{
+            Write-Host "Store:"$cb_Store.Text  -ForegroundColor Green
+            Set-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily -Store $cb_Store.Text
+        }
+    if ($cb_WeakHostReceive.Text -eq (Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand WeakHostReceive)){
+        Write-Host "WeakHostReceive is same, skipping."  -ForegroundColor green}
+        else{
+            Write-Host "WeakHostReceive:"$cb_WeakHostReceive.Text  -ForegroundColor Green
+            Set-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily -Store $cb_WeakHostReceive.Text
+        }
+    if ($cb_WeakHostSend.Text -eq (Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand WeakHostSend)){
+        Write-Host "WeakHostSend is same, skipping."  -ForegroundColor green}
+        else{
+            Write-Host "WeakHostSend:"$cb_WeakHostSend.Text  -ForegroundColor Green
+            Set-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily -Store $cb_WeakHostSend.Text
+        }
+    if ($tb_CurrentHopLimit.Text -eq (Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand CurrentHopLimit)){
+        Write-Host "CurrentHopLimit is same, skipping."  -ForegroundColor green}
+        else{
+            Write-Host "CurrentHopLimit:"$tb_CurrentHopLimit.Text  -ForegroundColor Green
+            Set-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily -CurrentHopLimit $tb_CurrentHopLimit.Text
+        }
+    if ($tb_BaseReachableTime.Text -eq (Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand BaseReachableTime)){
+        Write-Host "BaseReachableTime is same, skipping."  -ForegroundColor green}
+        else{
+            Write-Host "BaseReachableTime:"$tb_BaseReachableTime.Text  -ForegroundColor Green
+            Set-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily -BaseReachableTime $tb_BaseReachableTime.Text
+        }
+    if ($tb_ReachableTime.Text -eq (Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand ReachableTime)){
+        Write-Host "ReachableTime is same, skipping."  -ForegroundColor green}
+        else{
+            Write-Host "ReachableTime:"$tb_ReachableTime.Text  -ForegroundColor Green
+            Set-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily -ReachableTime $tb_ReachableTime.Text
+        }
+    if ($tb_DadRetransmitTime.Text -eq (Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand DadRetransmitTime)){
+        Write-Host "DadRetransmitTime is same, skipping."  -ForegroundColor green}
+        else{
+            Write-Host "DadRetransmitTime:"$tb_DadRetransmitTime.Text  -ForegroundColor Green
+            Set-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily -DadRetransmitTime $tb_DadRetransmitTime.Text
+        }
+    if ($tb_DadTransmits.Text -eq (Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand DadTransmits)){
+        Write-Host "DadTransmits is same, skipping."  -ForegroundColor green}
+        else{
+            Write-Host "DadTransmits:"$tb_DadTransmits.Text  -ForegroundColor Green
+            Set-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily -DadTransmits $tb_DadTransmits.Text
+        }
+    if ($tb_NlMtu.Text -eq (Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand NlMtu)){
+        Write-Host "NlMtu is same, skipping."  -ForegroundColor green}
+        else{
+            Write-Host "NlMtu:"$tb_NlMtu.Text  -ForegroundColor Green
+            Set-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily -NlMtu $tb_NlMtu.Text
+        }
+    if ($tb_RetransmitTime.Text -eq (Get-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily | Select-Object -Expand RetransmitTime)){
+        Write-Host "RetransmitTime is same, skipping."  -ForegroundColor green}
+        else{
+            Write-Host "RetransmitTime:"$tb_RetransmitTime.Text  -ForegroundColor Green
+            Set-NetIPInterface -InterfaceAlias $NetConnectionID -AddressFamily $Global:AddressFamily -RetransmitTime $tb_RetransmitTime.Text
+        }
+}
+
+function IPv4_CheckedChanged(){
+if ($cb_IPv4.Checked){
+    $cb_IPv6.Enabled = $false
+    $Global:AddressFamily = "IPv4"
+    RefreshingNetIPInterfaceSettings
+    }else{
+    $cb_IPv6.Enabled = $true
+    $Global:AddressFamily = "IPv6"
+    RefreshingNetIPInterfaceSettings
+    }
+if ($cb_IPv4.Checked -eq $false -and $cb_IPv6.Checked -eq $false -or $cb_IPv4.Checked -eq $false -and $cb_IPv6.Visible -eq $false ){
+        Write-Warning "IPv4 and IPv6 are not Checked, Disabling Interface-Settings."
+        $Groupbox7.Enabled = $false
+        $btn_applyInterfaceSettings.Enabled = $false
+    }else{
+        $Groupbox7.Enabled = $true
+        $btn_applyInterfaceSettings.Enabled = $true
+    }
+}
+
+function IPv6_CheckedChanged(){
+if ($cb_IPv6.Checked){
+    $cb_IPv4.Enabled = $false
+    $Global:AddressFamily = "IPv6"
+    RefreshingNetIPInterfaceSettings
+    }else{
+    $cb_IPv4.Enabled = $true
+    $Global:AddressFamily = "IPv4"}
+    RefreshingNetIPInterfaceSettings
+    }
+    
+if ($cb_IPv4.Checked -eq $false -and $cb_IPv6.Checked -eq $false -or $cb_IPv4.Checked -eq $false -and $cb_IPv6.Visible -eq $false  ){
+        Write-Warning "IPv4 and IPv6 are not Checked, Disabling Interface-Settings."
+        $Groupbox7.Enabled = $false
+        $btn_applyInterfaceSettings.Enabled = $false
+    }else{
+        $Groupbox7.Enabled = $true
+        $btn_applyInterfaceSettings.Enabled = $true
+    }
+
+function RefreshingNetIPInterfaceSettings {
+    try {
+        if (-not $Global:NetConnectionID) { return }
+        if (-not $Global:AddressFamily)  { $Global:AddressFamily = "IPv4" }
+
+        $iface = Get-NetIPInterface -InterfaceAlias $Global:NetConnectionID `
+                                    -AddressFamily   $Global:AddressFamily `
+                                    -ErrorAction SilentlyContinue | Select-Object *
+        if (-not $iface) { return }
+
+        $map = @{
+            'cb_AdvertiseDefaultRoute'           = 'AdvertiseDefaultRoute'
+            'cb_Advertising'                     = 'Advertising'
+            'cb_AutomaticMetric'                 = 'AutomaticMetric'
+            'cb_ClampMss'                        = 'ClampMss'
+            'cb_DirectedMacWolPattern'           = 'DirectedMacWolPattern'
+            'cb_EcnMarking'                      = 'EcnMarking'
+            'cb_ForceArpNdWolPattern'            = 'ForceArpNdWolPattern'
+            'cb_Forwarding'                      = 'Forwarding'
+            'cb_IgnoreDefaultRoutes'             = 'IgnoreDefaultRoutes'
+            'cb_ManagedAddressConfiguration'     = 'ManagedAddressConfiguration'
+            'cb_NeighborDiscoverySupported'      = 'NeighborDiscoverySupported'
+            'cb_NeighborUnreachabilityDetection' = 'NeighborUnreachabilityDetection'
+            'cb_OtherStatefulConfiguration'      = 'OtherStatefulConfiguration'
+            'cb_RouterDiscovery'                 = 'RouterDiscovery'
+            'cb_Store'                           = 'Store'
+            'cb_WeakHostReceive'                 = 'WeakHostReceive'
+            'cb_WeakHostSend'                    = 'WeakHostSend'
+        }
+
+        foreach ($entry in $map.GetEnumerator()) {
+            $ctrlName = $entry.Key
+            $propName = $entry.Value
+
+            $ctrlVar = Get-Variable -Name $ctrlName -Scope Script -ErrorAction SilentlyContinue
+            if (-not $ctrlVar) { $ctrlVar = Get-Variable -Name $ctrlName -Scope Global -ErrorAction SilentlyContinue }
+            if (-not $ctrlVar) { continue }
+
+            $ctrl = $ctrlVar.Value
+            if (-not $ctrl) { continue }
+
+            if ($iface.PSObject.Properties.Name -contains $propName) {
+                $value = [string]$iface.$propName
+                $ctrl.Text = $value
+            }
+        }
+
+        # Numeric text fields
+        if ($iface.PSObject.Properties.Name -contains 'CurrentHopLimit')      { $tb_CurrentHopLimit.Text   = [string]$iface.CurrentHopLimit }
+        if ($iface.PSObject.Properties.Name -contains 'BaseReachableTime')    { $tb_BaseReachableTime.Text = [string]$iface.BaseReachableTime }
+        if ($iface.PSObject.Properties.Name -contains 'ReachableTime')        { $tb_ReachableTime.Text     = [string]$iface.ReachableTime }
+        if ($iface.PSObject.Properties.Name -contains 'DadRetransmitTime')    { $tb_DadRetransmitTime.Text = [string]$iface.DadRetransmitTime }
+        if ($iface.PSObject.Properties.Name -contains 'DadTransmits')         { $tb_DadTransmits.Text      = [string]$iface.DadTransmits }
+        if ($iface.PSObject.Properties.Name -contains 'RetransmitTime')       { $tb_RetransmitTime.Text    = [string]$iface.RetransmitTime }
+        if ($iface.PSObject.Properties.Name -contains 'NlMtu')                { $tb_NlMtu.Text             = [string]$iface.NlMtu }
+
+    } catch {
+        Write-Verbose "Interface Settings refresh skipped: $($_.Exception.Message)"
+    }
+}
+
+function Get-InterfaceSettingsSnapshot {
+    if (-not $Global:NetConnectionID) { return $null }
+    if (-not $Global:AddressFamily)  { $Global:AddressFamily = 'IPv4' }
+
+    $iface = Get-NetIPInterface -InterfaceAlias $Global:NetConnectionID -AddressFamily $Global:AddressFamily -ErrorAction SilentlyContinue | Select-Object *
+    if (-not $iface) { return $null }
+
+    $snap = [ordered]@{
+        Alias   = $Global:NetConnectionID
+        AF      = $Global:AddressFamily
+        AdvertiseDefaultRoute           = [string]$iface.AdvertiseDefaultRoute
+        Advertising                     = [string]$iface.Advertising
+        AutomaticMetric                 = [string]$iface.AutomaticMetric
+        ClampMss                        = [string]$iface.ClampMss
+        DirectedMacWolPattern           = [string]$iface.DirectedMacWolPattern
+        EcnMarking                      = [string]$iface.EcnMarking
+        ForceArpNdWolPattern            = [string]$iface.ForceArpNdWolPattern
+        Forwarding                      = [string]$iface.Forwarding
+        IgnoreDefaultRoutes             = [string]$iface.IgnoreDefaultRoutes
+        ManagedAddressConfiguration     = [string]$iface.ManagedAddressConfiguration
+        NeighborDiscoverySupported      = [string]$iface.NeighborDiscoverySupported
+        NeighborUnreachabilityDetection = [string]$iface.NeighborUnreachabilityDetection
+        OtherStatefulConfiguration      = [string]$iface.OtherStatefulConfiguration
+        RouterDiscovery                 = [string]$iface.RouterDiscovery
+        Store                           = [string]$iface.Store
+        WeakHostReceive                 = [string]$iface.WeakHostReceive
+        WeakHostSend                    = [string]$iface.WeakHostSend
+        CurrentHopLimit    = [int]$iface.CurrentHopLimit
+        BaseReachableTime  = [int]$iface.BaseReachableTime
+        ReachableTime      = [int]$iface.ReachableTime
+        DadRetransmitTime  = [int]$iface.DadRetransmitTime
+        DadTransmits       = [int]$iface.DadTransmits
+        RetransmitTime     = [int]$iface.RetransmitTime
+        NlMtu              = [int]$iface.NlMtu
+    }
+    return [pscustomobject]$snap
+}
+
+function Apply-InterfaceSettingsFromSnapshot($snap) {
+    if (-not $snap) { return }
+
+    $cb_AdvertiseDefaultRoute.Text           = $snap.AdvertiseDefaultRoute
+    $cb_Advertising.Text                     = $snap.Advertising
+    $cb_AutomaticMetric.Text                 = $snap.AutomaticMetric
+    $cb_ClampMss.Text                        = $snap.ClampMss
+    $cb_DirectedMacWolPattern.Text           = $snap.DirectedMacWolPattern
+    $cb_EcnMarking.Text                      = $snap.EcnMarking
+    $cb_ForceArpNdWolPattern.Text            = $snap.ForceArpNdWolPattern
+    $cb_Forwarding.Text                      = $snap.Forwarding
+    $cb_IgnoreDefaultRoutes.Text             = $snap.IgnoreDefaultRoutes
+    $cb_ManagedAddressConfiguration.Text     = $snap.ManagedAddressConfiguration
+    $cb_NeighborDiscoverySupported.Text      = $snap.NeighborDiscoverySupported
+    $cb_NeighborUnreachabilityDetection.Text = $snap.NeighborUnreachabilityDetection
+    $cb_OtherStatefulConfiguration.Text      = $snap.OtherStatefulConfiguration
+    $cb_RouterDiscovery.Text                 = $snap.RouterDiscovery
+    $cb_Store.Text                           = $snap.Store
+    $cb_WeakHostReceive.Text                 = $snap.WeakHostReceive
+    $cb_WeakHostSend.Text                    = $snap.WeakHostSend
+
+    $tb_CurrentHopLimit.Text   = [string]$snap.CurrentHopLimit
+    $tb_BaseReachableTime.Text = [string]$snap.BaseReachableTime
+    $tb_ReachableTime.Text     = [string]$snap.ReachableTime
+    $tb_DadRetransmitTime.Text = [string]$snap.DadRetransmitTime
+    $tb_DadTransmits.Text      = [string]$snap.DadTransmits
+    $tb_RetransmitTime.Text    = [string]$snap.RetransmitTime
+    $tb_NlMtu.Text             = [string]$snap.NlMtu
+
+    $applyBtnVar = Get-Variable -Name 'btn_applyInterfaceSettings' -Scope Script -ErrorAction SilentlyContinue
+    if ($applyBtnVar) {
+        ($applyBtnVar.Value).PerformClick()
+        return
+    }
+
+    try {
+        $params = @{
+          InterfaceAlias = $snap.Alias
+          AddressFamily  = $snap.AF
+          AdvertiseDefaultRoute           = $snap.AdvertiseDefaultRoute
+          Advertising                     = $snap.Advertising
+          AutomaticMetric                 = $snap.AutomaticMetric
+          ClampMss                        = $snap.ClampMss
+          DirectedMacWolPattern           = $snap.DirectedMacWolPattern
+          EcnMarking                      = $snap.EcnMarking
+          ForceArpNdWolPattern            = $snap.ForceArpNdWolPattern
+          Forwarding                      = $snap.Forwarding
+          IgnoreDefaultRoutes             = $snap.IgnoreDefaultRoutes
+          ManagedAddressConfiguration     = $snap.ManagedAddressConfiguration
+          NeighborDiscoverySupported      = $snap.NeighborDiscoverySupported
+          NeighborUnreachabilityDetection = $snap.NeighborUnreachabilityDetection
+          OtherStatefulConfiguration      = $snap.OtherStatefulConfiguration
+          RouterDiscovery                 = $snap.RouterDiscovery
+          WeakHostReceive                 = $snap.WeakHostReceive
+          WeakHostSend                    = $snap.WeakHostSend
+          NlMtu           = $snap.NlMtu
+          CurrentHopLimit = $snap.CurrentHopLimit
+          BaseReachableTime = $snap.BaseReachableTime
+          ReachableTime   = $snap.ReachableTime
+          DadRetransmitTime = $snap.DadRetransmitTime
+          DadTransmits    = $snap.DadTransmits
+          RetransmitTime  = $snap.RetransmitTime
+        }
+        Set-NetIPInterface @params -ErrorAction Stop | Out-Null
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show("Restore parziale: $($_.Exception.Message)","Restore",
+            [System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Warning) | Out-Null
+    }
+}
+
+function applyall{
+    if($Groupbox7.Enabled -eq $False){
+    Write-Host "Applying All Settings!" -ForegroundColor Yellow
+    Write-Host "`n"
+    Write-Host "===== Global Settings =====" -ForegroundColor Yellow
+    applyglobal
+    Write-Host "`n"
+    Write-Host "===== RSS Settings =====" -ForegroundColor Yellow
+    applyrsssettings
+    Write-Host "`n"
+    Write-Host "===== PowerSaving Settings =====" -ForegroundColor Yellow
+    applypowersavingsettings
+    Write-Host "`n"
+    Write-Warning "===== IP-Interface Settings ====="
+    Write-Warning "IPv4 or IPv6 not specified!"
+    Write-Host "`n"
+    Write-Host "===== Adapter Advanced Settings =====" -ForegroundColor Yellow
+    applyadvsettings    
+        
+    }else{
+    Write-Host "Applying All Settings!" -ForegroundColor Yellow
+    
+    Write-Host "===== Global Settings =====" -ForegroundColor Yellow
+    applyglobal
+    
+    Write-Host "===== RSS Settings =====" -ForegroundColor Yellow
+    applyrsssettings
+    
+    Write-Host "===== PowerSaving Settings =====" -ForegroundColor Yellow
+    applypowersavingsettings
+    
+    Write-Host "===== IP-Interface Settings =====" -ForegroundColor Yellow
+    ApplyInterfaceSettings
+    
+    Write-Host "===== Adapter Advanced Settings =====" -ForegroundColor Yellow
+    applyadvsettings
+    }
+}
+
+function RegistryTweaks{
+        #$ErrorActionPreference = 'Continue'
+		#DefaultReceiveWindow
+		$A=((Get-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters").PSObject.Properties.Name -contains "DefaultReceiveWindow")
+		if ($A -eq $false -and $cb_Afd_defaultrecWin.Text -ne $null -and $cb_Afd_defaultrecWin.Text -ne '' ){
+			Write-Host "Set AFDDefaultReceiveWindow to"$cb_Afd_defaultrecWin.Text -ForegroundColor Green
+	        New-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "DefaultReceiveWindow" -Typ "Dword" -Value $cb_Afd_defaultrecWin.Text -Force
+		}elseif($A -eq $true -and $cb_Afd_defaultrecWin.Text -eq $null -or $cb_Afd_defaultrecWin.Text -eq ''){
+			Write-Warning "Removing AFDDefaultReceiveWindow"
+			Remove-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "DefaultReceiveWindow"
+		}else{
+			Write-Host "Set AFDDefaultReceiveWindow to"$cb_Afd_defaultrecWin.Text -ForegroundColor Green
+	        Set-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "DefaultReceiveWindow" -Value $cb_Afd_defaultrecWin.Text -Force	
+		}
+        
+        #DefaultSendWindow
+		$A=((Get-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters").PSObject.Properties.Name -contains "DefaultSendWindow")
+		if ($A -eq $false -and $cb_Afd_defaultSendWin.Text -ne $null -and $cb_Afd_defaultSendWin.Text -ne '' ){
+			Write-Host "Set AFDDefaultSendWindow to"$cb_Afd_defaultSendWin.Text -ForegroundColor Green
+	        New-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "DefaultSendWindow" -Typ "Dword" -Value $cb_Afd_defaultSendWin.Text -Force
+		}elseif($A -eq $true -and $cb_Afd_defaultSendWin.Text -eq $null -or $cb_Afd_defaultSendWin.Text -eq ''){
+			Write-Warning "Removing AFDDefaultSendWindow"
+			Remove-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "DefaultSendWindow"
+		}else{
+			Write-Host "Set AFDDefaultSendWindow to"$cb_Afd_defaultSendWin.Text -ForegroundColor Green
+	        Set-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "DefaultSendWindow" -Value $cb_Afd_defaultSendWin.Text -Force	
+		}
+        
+        #DisableAddressSharing
+		$A=((Get-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters").PSObject.Properties.Name -contains "DisableAddressSharing")
+		if ($A -eq $false -and $cb_DisableAddressSharing.Text -ne $null -and $cb_DisableAddressSharing.Text -ne '' ){
+			Write-Host "Set AFDDisableAddressSharing to"$cb_DisableAddressSharing.Text -ForegroundColor Green
+	        New-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "DisableAddressSharing" -Typ "Dword" -Value $cb_DisableAddressSharing.Text -Force
+		}elseif($A -eq $true -and $cb_DisableAddressSharing.Text -eq $null -or $cb_DisableAddressSharing.Text -eq ''){
+			Write-Warning "Removing AFDDisableAddressSharing"
+			Remove-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "DisableAddressSharing"
+		}else{
+			Write-Host "Set AFDDisableAddressSharing to"$cb_DisableAddressSharing.Text -ForegroundColor Green
+	        Set-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "DisableAddressSharing" -Value $cb_DisableAddressSharing.Text -Force	
+		}
+		
+		#BufferMultiplier
+		$A=((Get-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters").PSObject.Properties.Name -contains "BufferMultiplier")
+		if ($A -eq $false -and $cb_BufferMultiplier.Text -ne $null -and $cb_BufferMultiplier.Text -ne '' ){
+			Write-Host "Set AFDBufferMultiplier to"$cb_BufferMultiplier.Text -ForegroundColor Green
+	        New-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "BufferMultiplier" -Typ "Dword" -Value $cb_BufferMultiplier.Text -Force
+		}elseif($A -eq $true -and $cb_BufferMultiplier.Text -eq $null -or $cb_BufferMultiplier.Text -eq ''){
+			Write-Warning "Removing AFDBufferMultiplier"
+			Remove-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "BufferMultiplier"
+		}else{
+			Write-Host "Set AFDBufferMultiplier to"$cb_BufferMultiplier.Text -ForegroundColor Green
+	        Set-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "BufferMultiplier" -Value $cb_BufferMultiplier.Text -Force	
+		}
+		
+        #BufferAlignment
+		$A=((Get-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters").PSObject.Properties.Name -contains "BufferAlignment")
+		if ($A -eq $false -and $cb_BufferAlignment.Text -ne $null -and $cb_BufferAlignment.Text -ne '' ){
+			Write-Host "Set AFDBufferAlignment to"$cb_BufferAlignment.Text -ForegroundColor Green
+	        New-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "BufferAlignment" -Typ "Dword" -Value $cb_BufferAlignment.Text -Force
+		}elseif($A -eq $true -and $cb_BufferAlignment.Text -eq $null -or $cb_BufferAlignment.Text -eq ''){
+			Write-Warning "Removing AFDBufferAlignment"
+			Remove-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "BufferAlignment"
+		}else{
+			Write-Host "Set AFDBufferAlignment to"$cb_BufferAlignment.Text -ForegroundColor Green
+	        Set-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "BufferAlignment" -Value $cb_BufferAlignment.Text -Force	
+		}
+		
+        #DoNotHoldNICBuffers
+		$A=((Get-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters").PSObject.Properties.Name -contains "DoNotHoldNICBuffers")
+		if ($A -eq $false -and $cb_DoNotHoldNICBuffers.Text -ne $null -and $cb_DoNotHoldNICBuffers.Text -ne '' ){
+			Write-Host "Set AFDDoNotHoldNICBuffers to"$cb_DoNotHoldNICBuffers.Text -ForegroundColor Green
+	        New-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "DoNotHoldNICBuffers" -Typ "Dword" -Value $cb_DoNotHoldNICBuffers.Text -Force
+		}elseif($A -eq $true -and $cb_DoNotHoldNICBuffers.Text -eq $null -or $cb_DoNotHoldNICBuffers.Text -eq ''){
+			Write-Warning "Removing AFDDoNotHoldNICBuffers"
+			Remove-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "DoNotHoldNICBuffers"
+		}else{
+			Write-Host "Set AFDDoNotHoldNICBuffers to"$cb_DoNotHoldNICBuffers.Text -ForegroundColor Green
+	        Set-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "DoNotHoldNICBuffers" -Value $cb_DoNotHoldNICBuffers.Text -Force	
+		}
+		
+		#SmallBufferSize
+		$A=((Get-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters").PSObject.Properties.Name -contains "SmallBufferSize")
+		if ($A -eq $false -and $cb_SmallBufferSize.Text -ne $null -and $cb_SmallBufferSize.Text -ne '' ){
+			Write-Host "Set AFDSmallBufferSize to"$cb_SmallBufferSize.Text -ForegroundColor Green
+	        New-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "SmallBufferSize" -Typ "Dword" -Value $cb_SmallBufferSize.Text -Force
+		}elseif($A -eq $true -and $cb_SmallBufferSize.Text -eq $null -or $cb_SmallBufferSize.Text -eq ''){
+			Write-Warning "Removing AFDSmallBufferSize"
+			Remove-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "SmallBufferSize"
+		}else{
+			Write-Host "Set AFDSmallBufferSize to"$cb_SmallBufferSize.Text -ForegroundColor Green
+	        Set-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "SmallBufferSize" -Value $cb_SmallBufferSize.Text -Force	
+		}
+		
+		#MediumBufferSize
+		$A=((Get-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters").PSObject.Properties.Name -contains "MediumBufferSize")
+		if ($A -eq $false -and $cb_MediumBufferSize.Text -ne $null -and $cb_MediumBufferSize.Text -ne '' ){
+			Write-Host "Set AFDMediumBufferSize to"$cb_MediumBufferSize.Text -ForegroundColor Green
+	        New-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "MediumBufferSize" -Typ "Dword" -Value $cb_MediumBufferSize.Text -Force
+		}elseif($A -eq $true -and $cb_MediumBufferSize.Text -eq $null -or $cb_MediumBufferSize.Text -eq ''){
+			Write-Warning "Removing AFDMediumBufferSize"
+			Remove-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "MediumBufferSize"
+		}else{
+			Write-Host "Set AFDMediumBufferSize to"$cb_MediumBufferSize.Text -ForegroundColor Green
+	        Set-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "MediumBufferSize" -Value $cb_MediumBufferSize.Text -Force	
+		}
+		
+		#LargeBufferSize
+		$A=((Get-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters").PSObject.Properties.Name -contains "LargeBufferSize")
+		if ($A -eq $false -and $cb_LargeBufferSize.Text -ne $null -and $cb_LargeBufferSize.Text -ne '' ){
+			Write-Host "Set AFDLargeBufferSize to"$cb_LargeBufferSize.Text -ForegroundColor Green
+	        New-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "LargeBufferSize" -Typ "Dword" -Value $cb_LargeBufferSize.Text -Force
+		}elseif($A -eq $true -and $cb_LargeBufferSize.Text -eq $null -or $cb_LargeBufferSize.Text -eq ''){
+			Write-Warning "Removing AFDLargeBufferSize"
+			Remove-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "LargeBufferSize"
+		}else{
+			Write-Host "Set AFDLargeBufferSize to"$cb_LargeBufferSize.Text -ForegroundColor Green
+	        Set-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "LargeBufferSize" -Value $cb_LargeBufferSize.Text -Force	
+		}
+		
+		#HugeBufferSize
+		$A=((Get-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters").PSObject.Properties.Name -contains "HugeBufferSize")
+		if ($A -eq $false -and $cb_HugeBufferSize.Text -ne $null -and $cb_HugeBufferSize.Text -ne '' ){
+			Write-Host "Set AFDHugeBufferSize to"$cb_HugeBufferSize.Text -ForegroundColor Green
+	        New-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "HugeBufferSize" -Typ "Dword" -Value $cb_HugeBufferSize.Text -Force
+		}elseif($A -eq $true -and $cb_HugeBufferSize.Text -eq $null -or $cb_HugeBufferSize.Text -eq ''){
+			Write-Warning "Removing AFDHugeBufferSize"
+			Remove-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "HugeBufferSize"
+		}else{
+			Write-Host "Set AFDHugeBufferSize to"$cb_HugeBufferSize.Text -ForegroundColor Green
+	        Set-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "HugeBufferSize" -Value $cb_HugeBufferSize.Text -Force	
+		}
+		
+		#SmallBufferListDepth
+		$A=((Get-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters").PSObject.Properties.Name -contains "SmallBufferListDepth")
+		if ($A -eq $false -and $cb_SmallBufferListDepth.Text -ne $null -and $cb_SmallBufferListDepth.Text -ne '' ){
+			Write-Host "Set AFDSmallBufferListDepth to"$cb_SmallBufferListDepth.Text -ForegroundColor Green
+	        New-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "SmallBufferListDepth" -Typ "Dword" -Value $cb_SmallBufferListDepth.Text -Force
+		}elseif($A -eq $true -and $cb_SmallBufferListDepth.Text -eq $null -or $cb_SmallBufferListDepth.Text -eq ''){
+			Write-Warning "Removing AFDSmallBufferListDepth"
+			Remove-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "SmallBufferListDepth"
+		}else{
+			Write-Host "Set AFDSmallBufferListDepth to"$cb_SmallBufferListDepth.Text -ForegroundColor Green
+	        Set-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "SmallBufferListDepth" -Value $cb_SmallBufferListDepth.Text -Force	
+		}
+		
+		#MediumBufferListDepth
+		$A=((Get-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters").PSObject.Properties.Name -contains "MediumBufferListDepth")
+		if ($A -eq $false -and $cb_MediumBufferListDepth.Text -ne $null -and $cb_MediumBufferListDepth.Text -ne '' ){
+			Write-Host "Set AFDMediumBufferListDepth to"$cb_MediumBufferListDepth.Text -ForegroundColor Green
+	        New-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "MediumBufferListDepth" -Typ "Dword" -Value $cb_MediumBufferListDepth.Text -Force
+		}elseif($A -eq $true -and $cb_MediumBufferListDepth.Text -eq $null -or $cb_MediumBufferListDepth.Text -eq ''){
+			Write-Warning "Removing AFDMediumBufferListDepth"
+			Remove-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "MediumBufferListDepth"
+		}else{
+			Write-Host "Set AFDMediumBufferListDepth to"$cb_MediumBufferListDepth.Text -ForegroundColor Green
+	        Set-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "MediumBufferListDepth" -Value $cb_MediumBufferListDepth.Text -Force	
+		}
+		
+		#LargBufferListDepth
+		$A=((Get-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters").PSObject.Properties.Name -contains "LargBufferListDepth")
+		if ($A -eq $false -and $cb_LargBufferListDepth.Text -ne $null -and $cb_LargBufferListDepth.Text -ne '' ){
+			Write-Host "Set AFDLargBufferListDepth to"$cb_LargBufferListDepth.Text -ForegroundColor Green
+	        New-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "LargBufferListDepth" -Typ "Dword" -Value $cb_LargBufferListDepth.Text -Force
+		}elseif($A -eq $true -and $cb_LargBufferListDepth.Text -eq $null -or $cb_LargBufferListDepth.Text -eq ''){
+			Write-Warning "Removing AFDLargBufferListDepth"
+			Remove-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "LargBufferListDepth"
+		}else{
+			Write-Host "Set AFDLargBufferListDepth to"$cb_LargBufferListDepth.Text -ForegroundColor Green
+	        Set-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "LargBufferListDepth" -Value $cb_LargBufferListDepth.Text -Force	
+		}
+		
+		#DisableDirectAcceptEx
+		$A=((Get-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters").PSObject.Properties.Name -contains "DisableDirectAcceptEx")
+		if ($A -eq $false -and $cb_DisableDirectAcceptEx.Text -ne $null -and $cb_DisableDirectAcceptEx.Text -ne '' ){
+			Write-Host "Set AFDDisableDirectAcceptEx to"$cb_DisableDirectAcceptEx.Text -ForegroundColor Green
+	        New-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "DisableDirectAcceptEx" -Typ "Dword" -Value $cb_DisableDirectAcceptEx.Text -Force
+		}elseif($A -eq $true -and $cb_DisableDirectAcceptEx.Text -eq $null -or $cb_DisableDirectAcceptEx.Text -eq ''){
+			Write-Warning "Removing AFDDisableDirectAcceptEx"
+			Remove-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "DisableDirectAcceptEx"
+		}else{
+			Write-Host "Set AFDDisableDirectAcceptEx to"$cb_DisableDirectAcceptEx.Text -ForegroundColor Green
+	        Set-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "DisableDirectAcceptEx" -Value $cb_DisableDirectAcceptEx.Text -Force	
+		}
+		
+		#DisableChainedReceive
+		$A=((Get-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters").PSObject.Properties.Name -contains "DisableChainedReceive")
+		if ($A -eq $false -and $cb_DisableChainedReceive.Text -ne $null -and $cb_DisableChainedReceive.Text -ne '' ){
+			Write-Host "Set AFDDisableChainedReceive to"$cb_DisableChainedReceive.Text -ForegroundColor Green
+	        New-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "DisableChainedReceive" -Typ "Dword" -Value $cb_DisableChainedReceive.Text -Force
+		}elseif($A -eq $true -and $cb_DisableChainedReceive.Text -eq $null -or $cb_DisableChainedReceive.Text -eq ''){
+			Write-Warning "Removing AFDDisableChainedReceive"
+			Remove-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "DisableChainedReceive"
+		}else{
+			Write-Host "Set AFDDisableChainedReceive to"$cb_DisableChainedReceive.Text -ForegroundColor Green
+	        Set-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "DisableChainedReceive" -Value $cb_DisableChainedReceive.Text -Force	
+		}
+		
+		#DisableRawSecurity
+		$A=((Get-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters").PSObject.Properties.Name -contains "DisableRawSecurity")
+		if ($A -eq $false -and $cb_DisableRawSecurity.Text -ne $null -and $cb_DisableRawSecurity.Text -ne '' ){
+			Write-Host "Set AFDDisableRawSecurity to"$cb_DisableRawSecurity.Text -ForegroundColor Green
+	        New-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "DisableRawSecurity" -Typ "Dword" -Value $cb_DisableRawSecurity.Text -Force
+		}elseif($A -eq $true -and $cb_DisableRawSecurity.Text -eq $null -or $cb_DisableRawSecurity.Text -eq ''){
+			Write-Warning "Removing AFDDisableRawSecurity"
+			Remove-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "DisableRawSecurity"
+		}else{
+			Write-Host "Set AFDDisableRawSecurity to"$cb_DisableRawSecurity.Text -ForegroundColor Green
+	        Set-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "DisableRawSecurity" -Value $cb_DisableRawSecurity.Text -Force	
+		}
+		
+		#DynamicSendBufferDisable
+		$A=((Get-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters").PSObject.Properties.Name -contains "DynamicSendBufferDisable")
+		if ($A -eq $false -and $cb_DynamicSendBufferDisable.Text -ne $null -and $cb_DynamicSendBufferDisable.Text -ne '' ){
+			Write-Host "Set AFDDynamicSendBufferDisable to"$cb_DynamicSendBufferDisable.Text -ForegroundColor Green
+	        New-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "DynamicSendBufferDisable" -Typ "Dword" -Value $cb_DynamicSendBufferDisable.Text -Force
+		}elseif($A -eq $true -and $cb_DynamicSendBufferDisable.Text -eq $null -or $cb_DynamicSendBufferDisable.Text -eq ''){
+			Write-Warning "Removing AFDDynamicSendBufferDisable"
+			Remove-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "DynamicSendBufferDisable"
+		}else{
+			Write-Host "Set AFDDynamicSendBufferDisable to"$cb_DynamicSendBufferDisable.Text -ForegroundColor Green
+	        Set-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "DynamicSendBufferDisable" -Value $cb_DynamicSendBufferDisable.Text -Force	
+		}
+		
+		#FastSendDatagramThreshold
+		$A=((Get-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters").PSObject.Properties.Name -contains "FastSendDatagramThreshold")
+		if ($A -eq $false -and $cb_FastSendDatagramThreshold.Text -ne $null -and $cb_FastSendDatagramThreshold.Text -ne '' ){
+			Write-Host "Set AFDFastSendDatagramThreshold to"$cb_FastSendDatagramThreshold.Text -ForegroundColor Green
+	        New-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "FastSendDatagramThreshold" -Typ "Dword" -Value $cb_FastSendDatagramThreshold.Text -Force
+		}elseif($A -eq $true -and $cb_FastSendDatagramThreshold.Text -eq $null -or $cb_FastSendDatagramThreshold.Text -eq ''){
+			Write-Warning "Removing AFDFastSendDatagramThreshold"
+			Remove-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "FastSendDatagramThreshold"
+		}else{
+			Write-Host "Set AFDFastSendDatagramThreshold to"$cb_FastSendDatagramThreshold.Text -ForegroundColor Green
+	        Set-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "FastSendDatagramThreshold" -Value $cb_FastSendDatagramThreshold.Text -Force	
+		}
+		
+		#FastCopyReceiveThreshold
+		$A=((Get-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters").PSObject.Properties.Name -contains "FastCopyReceiveThreshold")
+		if ($A -eq $false -and $cb_FastCopyReceiveThreshold.Text -ne $null -and $cb_FastCopyReceiveThreshold.Text -ne '' ){
+			Write-Host "Set AFDFastCopyReceiveThreshold to"$cb_FastCopyReceiveThreshold.Text -ForegroundColor Green
+	        New-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "FastCopyReceiveThreshold" -Typ "Dword" -Value $cb_FastCopyReceiveThreshold.Text -Force
+		}elseif($A -eq $true -and $cb_FastCopyReceiveThreshold.Text -eq $null -or $cb_FastCopyReceiveThreshold.Text -eq ''){
+			Write-Warning "Removing AFDFastCopyReceiveThreshold"
+			Remove-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "FastCopyReceiveThreshold"
+		}else{
+			Write-Host "Set AFDFastCopyReceiveThreshold to"$cb_FastCopyReceiveThreshold.Text -ForegroundColor Green
+	        Set-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "FastCopyReceiveThreshold" -Value $cb_FastCopyReceiveThreshold.Text -Force	
+		}
+		
+		#IgnorePushBitOnReceives
+		$A=((Get-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters").PSObject.Properties.Name -contains "IgnorePushBitOnReceives")
+		if ($A -eq $false -and $cb_IgnorePushBitOnReceives.Text -ne $null -and $cb_IgnorePushBitOnReceives.Text -ne '' ){
+			Write-Host "Set AFDIgnorePushBitOnReceives to"$cb_IgnorePushBitOnReceives.Text -ForegroundColor Green
+	        New-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "IgnorePushBitOnReceives" -Typ "Dword" -Value $cb_IgnorePushBitOnReceives.Text -Force
+		}elseif($A -eq $true -and $cb_IgnorePushBitOnReceives.Text -eq $null -or $cb_IgnorePushBitOnReceives.Text -eq ''){
+			Write-Warning "Removing AFDIgnorePushBitOnReceives"
+			Remove-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "IgnorePushBitOnReceives"
+		}else{
+			Write-Host "Set AFDIgnorePushBitOnReceives to"$cb_IgnorePushBitOnReceives.Text -ForegroundColor Green
+	        Set-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "IgnorePushBitOnReceives" -Value $cb_IgnorePushBitOnReceives.Text -Force	
+		}
+		
+	    #IgnoreOrderlyRelease
+		$A=((Get-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters").PSObject.Properties.Name -contains "IgnoreOrderlyRelease")
+		if ($A -eq $false -and $cb_IgnoreOrderlyRelease.Text -ne $null -and $cb_IgnoreOrderlyRelease.Text -ne '' ){
+			Write-Host "Set AFDIgnoreOrderlyRelease to"$cb_IgnoreOrderlyRelease.Text -ForegroundColor Green
+	        New-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "IgnoreOrderlyRelease" -Typ "Dword" -Value $cb_IgnoreOrderlyRelease.Text -Force
+		}elseif($A -eq $true -and $cb_IgnoreOrderlyRelease.Text -eq $null -or $cb_IgnoreOrderlyRelease.Text -eq ''){
+			Write-Warning "Removing AFDIgnoreOrderlyRelease"
+			Remove-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "IgnoreOrderlyRelease"
+		}else{
+			Write-Host "Set AFDIgnoreOrderlyRelease to"$cb_IgnoreOrderlyRelease.Text -ForegroundColor Green
+	        Set-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "IgnoreOrderlyRelease" -Value $cb_IgnoreOrderlyRelease.Text -Force	
+		}
+		
+		#TransmitWorker
+		$A=((Get-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters").PSObject.Properties.Name -contains "TransmitWorker")
+		if ($A -eq $false -and $cb_TransmitWorker.Text -ne $null -and $cb_TransmitWorker.Text -ne '' ){
+			Write-Host "Set AFDTransmitWorker to"$cb_TransmitWorker.Text -ForegroundColor Green
+	        New-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "TransmitWorker" -Typ "Dword" -Value $cb_TransmitWorker.Text -Force
+		}elseif($A -eq $true -and $cb_TransmitWorker.Text -eq $null -or $cb_TransmitWorker.Text -eq ''){
+			Write-Warning "Removing AFDTransmitWorker"
+			Remove-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "TransmitWorker"
+		}else{
+			Write-Host "Set AFDTransmitWorker to"$cb_TransmitWorker.Text -ForegroundColor Green
+	        Set-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "TransmitWorker" -Value $cb_TransmitWorker.Text -Force	
+		}
+		
+		#PriorityBoost
+		$A=((Get-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters").PSObject.Properties.Name -contains "PriorityBoost")
+		if ($A -eq $false -and $cb_PriorityBoost.Text -ne $null -and $cb_PriorityBoost.Text -ne '' ){
+			Write-Host "Set AFDPriorityBoost to"$cb_PriorityBoost.Text -ForegroundColor Green
+	        New-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "PriorityBoost" -Typ "Dword" -Value $cb_PriorityBoost.Text -Force
+		}elseif($A -eq $true -and $cb_PriorityBoost.Text -eq $null -or $cb_PriorityBoost.Text -eq ''){
+			Write-Warning "Removing AFDPriorityBoost"
+			Remove-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "PriorityBoost"
+		}else{
+			Write-Host "Set AFDPriorityBoost to"$cb_PriorityBoost.Text -ForegroundColor Green
+	        Set-ItemProperty -Path "REGISTRY::HKEY_LOCAL_MACHINE\System\CurrentControlSet\Services\AFD\Parameters" -Name "PriorityBoost" -Value $cb_PriorityBoost.Text -Force	
+		}
+		
+		
+}
+
+function Get-FullBackupSnapshot {
+    if (-not $Global:NetConnectionID) { return $null }
+    if (-not $Global:AddressFamily)  { $Global:AddressFamily = 'IPv4' }
+
+    $ack    = Get-AckValues -NicName $Global:NetConnectionID
+    $iface  = Get-InterfaceSettingsSnapshot
+    $mmcss  = @{ NetworkThrottlingIndex = Get-RegistryDword -Path $MMCSS_Key -Name 'NetworkThrottlingIndex'
+                 SystemResponsiveness   = Get-RegistryDword -Path $MMCSS_Key -Name 'SystemResponsiveness' }
+
+    $msi = $null
+    if ($Global:NewPathInterrupt) {
+        $msiVal   = $null
+        $prioVal  = $null
+        try { $msiVal  = Get-ItemPropertyValue -Path "REGISTRY::$($Global:NewPathInterrupt)\Device Parameters\Interrupt Management\MessageSignaledInterruptProperties" -Name 'MSISupported' -ErrorAction Stop } catch {}
+        try { $prioVal = Get-ItemPropertyValue -Path "REGISTRY::$($Global:NewPathInterrupt)\Device Parameters\Interrupt Management\Affinity Policy" -Name 'DevicePriority' -ErrorAction Stop } catch {}
+        $msi = @{ Path=$Global:NewPathInterrupt; MSISupported=$msiVal; DevicePriority=$prioVal }
+    }
+
+    return [pscustomobject]@{
+        Timestamp      = Get-TimeStamp
+        Alias          = $Global:NetConnectionID
+        AddressFamily  = $Global:AddressFamily
+        Interface      = $iface
+        Ack            = $ack
+        Mmcss          = $mmcss
+        Msi            = $msi
+    }
+}
+
+function Export-RegistryBlock {
+    param([string]$Path,[string]$Destination)
+    if (-not $Path -or -not $Destination) { return $false }
+    if (-not (Test-Path $Path)) { return $false }
+    try {
+        & reg.exe export "$Path" "$Destination" /y | Out-Null
+        return $true
+    } catch { return $false }
+}
+
+function Invoke-RegistryBackup {
+    try {
+        $alias  = if ($Global:NetConnectionID) { $Global:NetConnectionID } else { 'System' }
+        $ts     = Get-TimeStamp
+        $folder = Join-Path $Global:BackupDir $alias
+        if (-not (Test-Path $folder)) { New-Item -Path $folder -ItemType Directory | Out-Null }
+
+        $exported = @()
+        $exported += Export-RegistryBlock -Path $Global:KeyPath -Destination (Join-Path $folder ("NIC_Registry_{0}.reg" -f $ts))
+        $exported += Export-RegistryBlock -Path "HKLM\SYSTEM\CurrentControlSet\Services\AFD\Parameters" -Destination (Join-Path $folder ("AFD_{0}.reg" -f $ts))
+        $exported += Export-RegistryBlock -Path $MMCSS_Key -Destination (Join-Path $folder ("MMCSS_{0}.reg" -f $ts))
+        if ($Global:NewPathInterrupt) {
+            $exported += Export-RegistryBlock -Path $Global:NewPathInterrupt -Destination (Join-Path $folder ("Interrupts_{0}.reg" -f $ts))
+        }
+
+        $msg = if ($exported -contains $true) { "Backup registro creato in:`n$folder" } else { "Nessuna chiave di registro esportata." }
+        [System.Windows.Forms.MessageBox]::Show($msg,"Backup Regedit",
+            [System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show("Export registro fallito: $($_.Exception.Message)","Backup Regedit",
+            [System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+    }
+}
+
+function Invoke-CreateRestorePoint {
+    try {
+        $alias = if ($Global:NetConnectionID) { $Global:NetConnectionID } else { 'NetworkTweaker' }
+        $ts    = Get-TimeStamp
+        Checkpoint-Computer -Description ("PrimeBuild NT RestorePoint {0} {1}" -f $alias,$ts) -RestorePointType MODIFY_SETTINGS | Out-Null
+        [System.Windows.Forms.MessageBox]::Show("Punto di ripristino creato.","Restore Point",
+            [System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show("Impossibile creare il punto di ripristino: $($_.Exception.Message)","Restore Point",
+            [System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+    }
+}
+
+function Invoke-BackupSave {
+    try {
+        if (-not $Global:NetConnectionID) { throw "Nessuna interfaccia selezionata." }
+        $ts     = Get-TimeStamp
+        $alias  = $Global:NetConnectionID
+        $folder = Join-Path $Global:BackupDir $alias
+        if (-not (Test-Path $folder)) { New-Item -Path $folder -ItemType Directory | Out-Null }
+
+        $snap = Get-FullBackupSnapshot
+        if ($snap) {
+            $jsonPath = Join-Path $folder ("FullBackup_{0}.json" -f $ts)
+            $snap | ConvertTo-Json -Depth 6 | Set-Content -Encoding UTF8 $jsonPath
+        }
+
+        Invoke-RegistryBackup
+
+        [System.Windows.Forms.MessageBox]::Show("Backup creato in:`n$folder","Backup",
+            [System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show("Backup fallito: $($_.Exception.Message)","Backup",
+            [System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+    }
+}
+
+function Invoke-BackupRestore {
+    try {
+        $alias  = $Global:NetConnectionID
+        $folder = if ($alias) { Join-Path $Global:BackupDir $alias } else { $Global:BackupDir }
+        if (-not (Test-Path $folder)) { throw "Nessun backup trovato." }
+
+        $ofd = New-Object System.Windows.Forms.OpenFileDialog
+        $ofd.InitialDirectory = $folder
+        $ofd.Filter = "Backup (*.json)|*.json|All files (*.*)|*.*"
+        $ofd.Multiselect = $false
+        if ($ofd.ShowDialog() -ne [System.Windows.Forms.DialogResult]::OK) { return }
+
+        $snap = Get-Content $ofd.FileName -Raw | ConvertFrom-Json
+        if (-not $snap) { throw "File non valido." }
+
+        if ($snap.Interface) { Apply-InterfaceSettingsFromSnapshot $snap.Interface }
+
+        if ($snap.Ack -and $snap.Ack.Path) {
+            foreach ($kv in 'TcpAckFrequency','TCPNoDelay','TcpDelAckTicks') {
+                if ($snap.Ack.PSObject.Properties.Name -contains $kv -and $null -ne $snap.Ack.$kv) {
+                    Set-InterfaceDword -Path $snap.Ack.Path -Name $kv -Value ([uint32]$snap.Ack.$kv)
+                }
+            }
+        }
+
+        if ($snap.Mmcss) {
+            if ($snap.Mmcss.NetworkThrottlingIndex -ne $null) { Set-RegistryDword -Path $MMCSS_Key -Name 'NetworkThrottlingIndex' -Value ([uint32]$snap.Mmcss.NetworkThrottlingIndex) }
+            if ($snap.Mmcss.SystemResponsiveness   -ne $null) { Set-RegistryDword -Path $MMCSS_Key -Name 'SystemResponsiveness'   -Value ([uint32]$snap.Mmcss.SystemResponsiveness) }
+        }
+
+        if ($snap.Msi -and $snap.Msi.Path) {
+            $msiPath = "REGISTRY::$($snap.Msi.Path)\Device Parameters\Interrupt Management\MessageSignaledInterruptProperties"
+            $affPath = "REGISTRY::$($snap.Msi.Path)\Device Parameters\Interrupt Management\Affinity Policy"
+            if ($snap.Msi.MSISupported -ne $null) { Set-RegistryDword -Path $msiPath -Name 'MSISupported' -Value ([uint32]$snap.Msi.MSISupported) }
+            if ($snap.Msi.DevicePriority -ne $null) { Set-RegistryDword -Path $affPath -Name 'DevicePriority' -Value ([uint32]$snap.Msi.DevicePriority) }
+        }
+
+        [System.Windows.Forms.MessageBox]::Show("Restore completato (vedi UI).","Restore",
+            [System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Information) | Out-Null
+    } catch {
+        [System.Windows.Forms.MessageBox]::Show("Restore fallito: $($_.Exception.Message)","Restore",
+            [System.Windows.Forms.MessageBoxButtons]::OK,[System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
+    }
+}
+
+function Opacity {
+    $modes = @{OpacityOn = "0.90"; OpacityOff = "1"}
+    $Form.Opacity = $(if ($Form.Opacity -eq $modes.OpacityOn){ $modes.OpacityOff } else { $modes.OpacityOn})
+
+}
+
+function HWSettings {
+    
+	if ($cb_MsiMode.SelectedIndex -eq (Get-ItemPropertyValue -Path "REGISTRY::$NewPathInterrupt\Device Parameters\Interrupt Management\MessageSignaledInterruptProperties" -Name "MSISupported")){
+		Write-Host "MSI-Mode is same then Registry, skipping."  -ForegroundColor Green}
+				
+		elseif ($cb_MsiMode.SelectedIndex -eq '0'){
+		Write-Host "Disabling MSI Mode." -ForegroundColor Green
+        Set-ItemProperty -Path "REGISTRY::$NewPathInterrupt\Device Parameters\Interrupt Management\MessageSignaledInterruptProperties" -Name "MSISupported" -Value "0"}
+		
+		elseif ($cb_MsiMode.SelectedIndex -eq '1'){
+		Write-Host "Enabling MSI Mode." -ForegroundColor Green
+        Set-ItemProperty -Path "REGISTRY::$NewPathInterrupt\Device Parameters\Interrupt Management\MessageSignaledInterruptProperties" -Name "MSISupported" -Value "1"}
+	
+	
+	if ($DevicePriorityAvailable -eq $false){
+		    Write-Host "Creating Device Priority DWORD with Value $($cb_InterruptPriority.Text)."  -ForegroundColor Green
+		    New-ItemProperty -Path "REGISTRY::$NewPathInterrupt\Device Parameters\Interrupt Management\Affinity Policy" -Name "DevicePriority" -Typ "Dword"
+		}elseif ($cb_InterruptPriority.SelectedIndex -eq '0'){
+			Write-Host "Setting DevicePriority to Undefined." -ForegroundColor Green
+            Set-ItemProperty -Path "REGISTRY::$NewPathInterrupt\Device Parameters\Interrupt Management\Affinity Policy" -Name "DevicePriority" -Value "0"}
+			
+		elseif ($cb_InterruptPriority.SelectedIndex -eq '1'){
+			Write-Host "Setting DevicePriority to Low." -ForegroundColor Green
+            Set-ItemProperty -Path "REGISTRY::$NewPathInterrupt\Device Parameters\Interrupt Management\Affinity Policy" -Name "DevicePriority" -Value "1"
+		    }
+		    
+		elseif ($cb_InterruptPriority.SelectedIndex -eq '2'){
+			    Write-Host "Setting DevicePriority to Normal." -ForegroundColor Green
+                Set-ItemProperty -Path "REGISTRY::$NewPathInterrupt\Device Parameters\Interrupt Management\Affinity Policy" -Name "DevicePriority" -Value "2"
+		    }
+			
+		elseif ($cb_InterruptPriority.SelectedIndex -eq '3'){
+			    Write-Host "Setting DevicePriority to High." -ForegroundColor Green
+                Set-ItemProperty -Path "REGISTRY::$NewPathInterrupt\Device Parameters\Interrupt Management\Affinity Policy" -Name "DevicePriority" -Value "3"
+		    }
+}
+
+
+$btn_InterruptApply.Add_Click({cls; HWSettings})
+$btn_registrytweaksapply.Add_Click({cls; RegistryTweaks})
+$btn_tcpOffloadApply.Add_Click({cls; TCPOffloadSettings})
+$cb_IPv4.Add_CheckedChanged({ IPv4_CheckedChanged })
+$cb_IPv6.Add_CheckedChanged({ IPv6_CheckedChanged })
+$btn_applyInterfaceSettings.Add_Click({cls; ApplyInterfaceSettings})
+$btn_openreg.Add_Click({btn_regopadap})
+$btn_adaptrest.Add_Click({cls; adapter_restart})
+$btn_applyadv.Add_Click({cls; applyadvsettings})
+$btn_applyglobal.Add_Click({cls; applyglobal })
+#$btn_applotadapters.Add_Click({applyotAdapters})
+$btn_apply.Add_Click({ cls; applyrsssettings })
+# Source: https://community.spiceworks.com/topic/2239276-script-help-to-disable-power-management-on-network-cards
+$btn_applypowersettings.Add_Click({cls; applypowersavingsettings})
+$btn_applyall.Add_Click({cls; applyall})
+$btn_rssaddsupport.Add_Click({cls; RSSEnable})
+$btn_unqueues.Add_Click({cls; RSSQueuesUnlock})
+$btn_Opacity.Add_Click({Opacity})
+
+#Notes:
+# Adding Additional Settings for Adv Tweaking
+
+#endregion
+
+[void]$Form.ShowDialog()
