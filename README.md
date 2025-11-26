@@ -1,71 +1,78 @@
-# Network Tweaker PB
+<p align="center">
+  <h1 align="center">Network Tweaker PB</h1>
+</p>
 
-![Version](https://img.shields.io/badge/Version-3.8-blue.svg)
-![PowerShell](https://img.shields.io/badge/PowerShell-5.1%2B-5e5eff.svg)
-![Windows](https://img.shields.io/badge/Windows-10%20%26%2011-0078D6.svg)
-![License](https://img.shields.io/badge/License-Free%20for%20personal%20use-success.svg)
+<p align="center">
+  <img src="https://img.shields.io/badge/Version-3.8-blue.svg?style=flat-square" alt="Version" />
+  <img src="https://img.shields.io/badge/PowerShell-5.1%2B-5e5eff.svg?style=flat-square" alt="PowerShell" />
+  <img src="https://img.shields.io/badge/Windows-10%20%26%2011-0078D6.svg?style=flat-square" alt="Windows" />
+  <img src="https://img.shields.io/badge/License-Personal%20Use-success.svg?style=flat-square" alt="License" />
+</p>
 
-Un tweaker avanzato per scheda di rete su Windows 10/11, progettato per **gaming competitivo** e latenza minima.
+<p align="center">
+  <strong>Un tweaker avanzato per la rete su Windows 10/11</strong><br>
+  Ottimizzato per gaming competitivo e latenza minima
+</p>
 
-Ottimizza in un click:
-- TCP Stack (BBR2, ECN, RTO, autotuning)
-- ACK immediati (TcpAckFrequency=1, TCPNoDelay=1)
-- RSC / Flow Control / Interrupt Moderation
-- RSS + MSI Interrupt pinning
-- QoS per-game (Fortnite, CS2, Valorant, COD, BF6, ecc.)
-- NDIS/MMCSS (NetworkThrottlingIndex = 0xFFFFFFFF)
-- Blocco SMB/NetBIOS/mDNS/RDP (modalità SAFE/ADVANCED)
+<p align="center">
+  <em>ACK immediati • BBR2 • RSC • RSS pinning • QoS per-game • Zero throttling</em>
+</p>
 
-> Include backup automatico e restore completo (JSON + .reg + restore point)
+> Backup automatico completo (JSON + .reg + punto di ripristino sistema)
 
 ---
 
-### Esecuzione rapida (one-liner)
+<p align="center">
+  <strong>Esecuzione in un solo comando</strong>
+</p>
 
 ```powershell
 irm https://github.com/PrimeBuild-pc/Network-Tweaker/raw/main/Network_Tweaker_PB.ps1 | iex
 ```
 
-> Richiede **PowerShell eseguito come Amministratore**
+> Richiede **PowerShell come Amministratore**
 
 ---
 
 ### Funzionalità principali
 
-| Categoria               | Cosa fa                                                                 |
-|-------------------------|--------------------------------------------------------------------------|
-| **TCP Gaming Preset**   | ACK immediati + Nagle off + DelAckTicks=0 su tutte le schede            |
-| **TCP Global**          | SAFE / BALANCED / AGGRESSIVE (BBR2, ECN, RTO 1000ms, autotuning off)    |
-| **NIC Extras**          | RSC On, Flow Control Off, Interrupt Moderation Low                     |
-| **RSS & MSI**           | Forzatura MSI + affinity su core veloci                                 |
-| **QoS per gioco**       | Priorità DSCP 46 + 802.1p per CS2, Valorant, Fortnite, ecc.            |
-| **NDIS/MMCSS**          | Disabilita throttling rete e dà priorità massima ai processi multimediali |
-| **Security**            | Blocca SMBv1, NetBIOS, mDNS, RDP (opzioni SAFE/ADVANCED)                |
-| **Backup & Restore**    | Snapshot completo + esportazione .reg + punto di ripristino sistema     |
+| Categoria             | Descrizione                                                                 |
+|-----------------------|-------------------------------------------------------------------------------|
+| **TCP Gaming Preset** | ACK immediati, Nagle off, DelAckTicks = 0 su tutte le schede                 |
+| **TCP Global**        | Preset SAFE / BALANCED / AGGRESSIVE (BBR2, ECN, autotuning off, RTO 1000ms) |
+| **NIC Extras**        | RSC On, Flow Control Off, Interrupt Moderation Low                          |
+| **RSS & MSI**         | Forzatura MSI + pinning su core veloci                                       |
+| **QoS per gioco**     | Priorità DSCP 46 + 802.1p per CS2, Valorant, Fortnite, COD, BF6, ecc.       |
+| **NDIS/MMCSS**        | NetworkThrottlingIndex = 0xFFFFFFFF • SystemResponsiveness = 0              |
+| **Security**          | Blocco SMBv1, NetBIOS, mDNS, RDP (modalità SAFE / ADVANCED)                 |
+| **Backup & Restore**  | Snapshot completo + esportazione .reg + restore point automatico            |
 
 ---
 
-<img width="544" height="428" alt="Screenshot 2025-11-24 194111" src="https://github.com/user-attachments/assets/a7db4c6b-aaf7-4b0a-8a6d-3f6ed98bd4f3" />
+<p align="center">
+  <img src="https://github.com/user-attachments/assets/a7db4c6b-aaf7-4b0a-8a6d-3f6ed98bd4f3" alt="Network Tweaker PB GUI" width="800" />
+  <br><br>
+  <em>Interfaccia grafica semplice e potente</em>
+</p>
 
 ---
 
 ### Compatibilità
 
-- Windows 10 22H2 / Windows 11 (tutte le versioni)
-- Realtek 8111/8125/8126, Intel I225/I226, Killer, AQC107, ecc.
+- Windows 10 22H2 • Windows 11 (tutte le edizioni)  
+- Realtek 8111/8125/8126 • Intel I225/I226 • Killer • AQC107 • e molte altre
 
 ---
 
 ### Crediti
 
-Realizzato da **PrimeBuild**  
-Progetto open-source, uso libero per scopi personali.  
-Non ridistribuire versioni modificate senza autorizzazione.
+Realizzato e mantenuto da **PrimeBuild**  
+Basato su uno script originale della community (autore sconosciuto) e completamente espanso
+
+Progetto open-source • Uso libero per scopi personali  
+Non ridistribuire versioni modificate senza autorizzazione
 
 ---
-```
-
-Copia e incolla questo contenuto direttamente nel tuo `README.md` del repository.  
-Se vuoi aggiungere uno screenshot reale, caricalo nella repo come `screenshot.png` (o cambiane il nome nel link).
-
-Divertiti e buona latenza! 🚀
+<p align="center">
+  Ottimizza la tua rete. Gioca senza compromessi.
+</p>
