@@ -1,0 +1,10 @@
+# Ignora tutto
+*
+
+# Eccezioni: permetti questi file
+!.gitignore
+!README.md
+!Network_Tweaker_PB.ps1
+
+# Ignora le cartelle
+*/
